@@ -69,6 +69,23 @@ is. Eén gecombineerde Nostr-subscriptie per kanaal routeert elk
 binnenkomend event op basis van zijn `kind` naar de juiste plek in de
 UI-state.
 
+## Versleuteling van de inhoud
+
+Relay-operators en anderen zonder de kanaal-URL kunnen niet meelezen: de
+`content` van élk event hierboven (chatberichten, document-/oproepnamen,
+weergavenamen, kanaalnaam, ...) wordt lokaal versleuteld vóórdat het de
+relay op gaat, met een sleutel die via HKDF wordt afgeleid uit het
+kanaal-ID zelf (`deriveChannelKey()` in App.jsx). Iedereen met de
+kanaal-URL (dus de `#<kanaal-id>` in de hash) kan zo lezen én schrijven;
+relays en toevallige meelezers zien alleen AES-GCM-ciphertext (IV +
+versleutelde bytes, base64). Alleen de tags die de relay zelf nodig heeft
+om events te kunnen filteren/adresseren (`t`, `d`, `p`) blijven
+onversleuteld — die bevatten geen inhoudelijke informatie, enkel
+kanaal-/document-/peer-identifiers. Dit is aparte, symmetrische
+versleuteling naast de NIP-04-versleuteling die al voor de
+WebRTC-signaling (SDP/ICE) werd gebruikt, die zit achter de identity-sleutel
+van elke peer.
+
 ## Hoe het werkt
 
 - **Kanaal-routing**: het kanaal-ID zit in de URL-hash. Geen hash → er wordt

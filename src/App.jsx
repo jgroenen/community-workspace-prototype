@@ -29,6 +29,12 @@ const LOCAL_SK_KEY = 'workspace_nostr_local_sk';
 // `publishEvent()`-helper in Dashboard, zodat elk event dezelfde
 // sign/publish/foutafhandeling deelt.
 //
+// De `content` van elk event hieronder is versleuteld met een uit het
+// kanaal-ID afgeleide sleutel (zie deriveChannelKey/encryptContent
+// verderop) — inclusief de weergavenaam van wie de actie deed, die dus
+// niet meer als losse leesbare tag meegaat. Alleen 't'/'d'/'p'-tags (nodig
+// voor relay-filtering/-adressering) blijven onversleuteld.
+//
 //   kind 1      chatbericht                (regulier, blijft bewaard)
 //   kind 1977   document aangemaakt        (regulier, blijft bewaard — klikbare link in chat)
 //   kind 1978   document geopend           (regulier, blijft bewaard — klikbare link in chat)
@@ -164,6 +170,63 @@ function mergeDocs(local, remote) {
   local.forEach((d) => map.set(d.id, d));
   remote.forEach((d) => map.set(d.id, d));
   return Array.from(map.values());
+}
+
+// -------------------------------------------------------------------
+// Content-encryptie: de `content` van élk Nostr-event (chatbericht,
+// document-/video-oproepnamen, kanaalnaam, wie welke actie deed, ...)
+// wordt versleuteld met een sleutel die uit het kanaal-ID zelf wordt
+// afgeleid — Web Crypto API (HKDF → AES-GCM), geen extra dependency nodig.
+// Iedereen met de kanaal-URL kan dus nog gewoon meelezen/schrijven (zelfde
+// vertrouwensmodel als "wie de link heeft"), maar relay-operators en
+// iedereen zonder die URL zien alleen ciphertext. De 't'/'d'/'p'-tags
+// blijven bewust onversleuteld: die heeft de relay nodig om events te
+// kunnen filteren/adresseren (versleutel je die ook, dan werkt de hele
+// subscriptie/NIP-33-addressering niet meer). De weergavenaam van de
+// afzender ('name'-tag in eerdere versies) zit daarom ook niet meer los
+// als tag, maar in de versleutelde content.
+async function deriveChannelKey(channelId) {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(channelId), 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: encoder.encode('community-workspace'), info: encoder.encode('channel-content-v1') },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  bytes.forEach((b) => {
+    binary += String.fromCharCode(b);
+  });
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function encryptContent(key, plaintext) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plaintext));
+  const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), iv.length);
+  return bytesToBase64(combined);
+}
+
+async function decryptContent(key, encoded) {
+  const combined = base64ToBytes(encoded);
+  const iv = combined.slice(0, 12);
+  const ciphertext = combined.slice(12);
+  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  return new TextDecoder().decode(plainBuf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -418,6 +481,25 @@ function Dashboard({ channelId, pool }) {
   // afhankelijk van wélke render de closure is aangemaakt.
   const identityRef = useRef(identity);
   identityRef.current = identity;
+  // De sleutel waarmee alle content in dit kanaal wordt versleuteld/
+  // ontsleuteld — afgeleid van het kanaal-ID (zie deriveChannelKey). State
+  // om effects erop te laten wachten, ref om 'm binnen de onevent-closure
+  // altijd actueel te kunnen lezen (zelfde reden als identityRef).
+  const [channelKey, setChannelKey] = useState(null);
+  const channelKeyRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    deriveChannelKey(channelId).then((key) => {
+      if (cancelled) return;
+      channelKeyRef.current = key;
+      setChannelKey(key);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId]);
+
   // Bewaart het created_at van het laatst toegepaste kanaalnaam-/
   // documentenlijst-/video-oproepenlijst-event. Zonder deze guard kan een
   // ouder event dat via een tragere relay laat aankomt (bv. het originele
@@ -454,8 +536,9 @@ function Dashboard({ channelId, pool }) {
   // is — dit is het architectuurprincipe: alle toestand die andere peers
   // moeten meekrijgen, gaat als Nostr-event het kanaal in.
   async function publishEvent(kind, tags, content = '') {
-    if (!identity || !pool) return null;
-    const template = { kind, created_at: Math.floor(Date.now() / 1000), tags, content };
+    if (!identity || !pool || !channelKeyRef.current) return null;
+    const encryptedContent = content ? await encryptContent(channelKeyRef.current, content) : '';
+    const template = { kind, created_at: Math.floor(Date.now() / 1000), tags, content: encryptedContent };
     try {
       const signed = await identity.signEvent(template);
       // pool.publish geeft per relay een eigen Promise terug; zonder .catch
@@ -473,7 +556,7 @@ function Dashboard({ channelId, pool }) {
   // zijn en waarom. Elk event wordt op basis van zijn kind naar de juiste
   // state gerouteerd.
   useEffect(() => {
-    if (!pool) return;
+    if (!pool || !channelKey) return;
     seenRef.current = new Set();
     setEntries([]);
     setPeerNames({});
@@ -502,9 +585,22 @@ function Dashboard({ channelId, pool }) {
         limit: 300,
       },
       {
-        onevent(event) {
+        async onevent(event) {
           if (seenRef.current.has(event.id)) return;
           seenRef.current.add(event.id);
+
+          // Content ontsleutelen vóórdat we 'm ergens op routeren. Voor
+          // CHAT_KIND is dat de rauwe berichttekst zelf; voor de rest een
+          // JSON-payload (die ook de weergavenaam van de afzender bevat,
+          // zie het architectuur-commentaar bovenaan het bestand).
+          let decrypted = '';
+          try {
+            decrypted = event.content ? await decryptContent(channelKeyRef.current, event.content) : '';
+          } catch {
+            // Verkeerde/nog niet beschikbare sleutel, of event van vóór
+            // deze versleuteling — negeren i.p.v. laten crashen.
+            return;
+          }
 
           const isSelf = Boolean(identityRef.current && event.pubkey === identityRef.current.pubkey);
           // Niet elke relay respecteert de NIP-01-richtlijn om ephemeral
@@ -526,7 +622,9 @@ function Dashboard({ channelId, pool }) {
             case CHAT_KIND: {
               setEntries((prev) => {
                 if (prev.some((e) => e.id === event.id)) return prev;
-                return [...prev, { type: 'chat', id: event.id, event }].sort((a, b) => entryTime(a) - entryTime(b));
+                return [...prev, { type: 'chat', id: event.id, event: { ...event, content: decrypted } }].sort(
+                  (a, b) => entryTime(a) - entryTime(b)
+                );
               });
               break;
             }
@@ -536,10 +634,9 @@ function Dashboard({ channelId, pool }) {
               // klikbare log-regels — ook je eigen acties blijven zichtbaar
               // (handig als geheugensteun om later terug te klikken), dus
               // géén isSelf/isRecent-filtering zoals bij de ephemeral events.
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let docId, docName;
+              let name, docId, docName;
               try {
-                ({ docId, docName } = JSON.parse(event.content));
+                ({ name, docId, docName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -549,16 +646,15 @@ function Dashboard({ channelId, pool }) {
                 if (prev.some((e) => e.id === event.id)) return prev;
                 return [
                   ...prev,
-                  { type: 'doclink', id: event.id, created_at: event.created_at, action, docId, docName, authorName: name },
+                  { type: 'doclink', id: event.id, created_at: event.created_at, action, docId, docName, authorName: name ?? 'Iemand' },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
               break;
             }
             case DOC_RENAMED_KIND: {
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let docId, oldName, newName;
+              let name, docId, oldName, newName;
               try {
-                ({ docId, oldName, newName } = JSON.parse(event.content));
+                ({ name, docId, oldName, newName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -575,36 +671,43 @@ function Dashboard({ channelId, pool }) {
                     docId,
                     docName: newName,
                     oldName,
-                    authorName: name,
+                    authorName: name ?? 'Iemand',
                   },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
               break;
             }
             case PRESENCE_JOIN_KIND: {
-              // Presence-events dragen de naam in een 'name'-tag.
-              const name = event.tags.find((t) => t[0] === 'name')?.[1];
+              let name;
+              try {
+                ({ name } = JSON.parse(decrypted));
+              } catch {
+                break;
+              }
               if (!name) break;
               setPeerNames((prev) => ({ ...prev, [event.pubkey]: name }));
               addSystemEntry(`${name} is de chat binnengekomen`);
               break;
             }
             case PRESENCE_RENAME_KIND: {
-              const name = event.tags.find((t) => t[0] === 'name')?.[1];
+              let name, oldname;
+              try {
+                ({ name, oldname } = JSON.parse(decrypted));
+              } catch {
+                break;
+              }
               if (!name) break;
-              const oldName = event.tags.find((t) => t[0] === 'oldname')?.[1] ?? 'Iemand';
               setPeerNames((prev) => ({ ...prev, [event.pubkey]: name }));
-              addSystemEntry(`${oldName} heet nu ${name}`);
+              addSystemEntry(`${oldname ?? 'Iemand'} heet nu ${name}`);
               break;
             }
             case CALL_STARTED_KIND:
             case CALL_OPENED_KIND: {
               // Zelfde opzet als DOC_CREATED_KIND/DOC_OPENED_KIND: blijvend
               // bewaard, klikbare link, ook je eigen acties blijven zichtbaar.
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let callId, callName;
+              let name, callId, callName;
               try {
-                ({ callId, callName } = JSON.parse(event.content));
+                ({ name, callId, callName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -614,16 +717,15 @@ function Dashboard({ channelId, pool }) {
                 if (prev.some((e) => e.id === event.id)) return prev;
                 return [
                   ...prev,
-                  { type: 'calllink', id: event.id, created_at: event.created_at, action, callId, callName, authorName: name },
+                  { type: 'calllink', id: event.id, created_at: event.created_at, action, callId, callName, authorName: name ?? 'Iemand' },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
               break;
             }
             case CALL_RENAMED_KIND: {
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let callId, oldName, newName;
+              let name, callId, oldName, newName;
               try {
-                ({ callId, oldName, newName } = JSON.parse(event.content));
+                ({ name, callId, oldName, newName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -640,17 +742,16 @@ function Dashboard({ channelId, pool }) {
                     callId,
                     callName: newName,
                     oldName,
-                    authorName: name,
+                    authorName: name ?? 'Iemand',
                   },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
               break;
             }
             case DOC_DELETED_KIND: {
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let docId, docName;
+              let name, docId, docName;
               try {
-                ({ docId, docName } = JSON.parse(event.content));
+                ({ name, docId, docName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -661,16 +762,20 @@ function Dashboard({ channelId, pool }) {
                 if (prev.some((e) => e.id === event.id)) return prev;
                 return [
                   ...prev,
-                  { type: 'system', id: event.id, created_at: event.created_at, text: `${name} heeft "${docName ?? 'een document'}" verwijderd` },
+                  {
+                    type: 'system',
+                    id: event.id,
+                    created_at: event.created_at,
+                    text: `${name ?? 'Iemand'} heeft "${docName ?? 'een document'}" verwijderd`,
+                  },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
               break;
             }
             case CALL_DELETED_KIND: {
-              const name = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
-              let callId, callName;
+              let name, callId, callName;
               try {
-                ({ callId, callName } = JSON.parse(event.content));
+                ({ name, callId, callName } = JSON.parse(decrypted));
               } catch {
                 break;
               }
@@ -685,7 +790,7 @@ function Dashboard({ channelId, pool }) {
                     type: 'system',
                     id: event.id,
                     created_at: event.created_at,
-                    text: `${name} heeft video-oproep "${callName ?? 'een video-oproep'}" verwijderd`,
+                    text: `${name ?? 'Iemand'} heeft video-oproep "${callName ?? 'een video-oproep'}" verwijderd`,
                   },
                 ].sort((a, b) => entryTime(a) - entryTime(b));
               });
@@ -698,7 +803,7 @@ function Dashboard({ channelId, pool }) {
               // stilletjes terugdraaien.
               if (event.created_at < docsAtRef.current) break;
               try {
-                const remoteDocs = JSON.parse(event.content);
+                const remoteDocs = JSON.parse(decrypted);
                 if (Array.isArray(remoteDocs) && remoteDocs.length) {
                   docsAtRef.current = event.created_at;
                   setDocs((prev) => mergeDocs(prev, remoteDocs));
@@ -711,7 +816,7 @@ function Dashboard({ channelId, pool }) {
             case CALLLIST_KIND: {
               if (event.created_at < callsAtRef.current) break;
               try {
-                const remoteCalls = JSON.parse(event.content);
+                const remoteCalls = JSON.parse(decrypted);
                 if (Array.isArray(remoteCalls) && remoteCalls.length) {
                   callsAtRef.current = event.created_at;
                   setCalls((prev) => mergeDocs(prev, remoteCalls));
@@ -727,8 +832,7 @@ function Dashboard({ channelId, pool }) {
               if (event.created_at < channelMetaAtRef.current) break;
               channelMetaAtRef.current = event.created_at;
               try {
-                const { name } = JSON.parse(event.content);
-                const authorName = event.tags.find((t) => t[0] === 'name')?.[1] ?? 'Iemand';
+                const { name, authorName } = JSON.parse(decrypted);
                 if (name) {
                   setSavedChannels((prev) => {
                     const next = prev.some((c) => c.id === channelId)
@@ -745,7 +849,7 @@ function Dashboard({ channelId, pool }) {
                     persistSavedChannels(next);
                     return next;
                   });
-                  addSystemEntry(`${authorName} heeft het kanaal hernoemd naar "${name}"`);
+                  addSystemEntry(`${authorName ?? 'Iemand'} heeft het kanaal hernoemd naar "${name}"`);
                 }
               } catch {
                 /* corrupte payload negeren */
@@ -759,21 +863,18 @@ function Dashboard({ channelId, pool }) {
       }
     );
     return () => sub.close();
-  }, [pool, chatTag, channelId, identity]);
+  }, [pool, chatTag, channelId, identity, channelKey]);
 
   // Kondig één keer per sessie/kanaal aan dat je de chat binnenkomt, zodra
   // je identiteit bekend is. De joinedRef-guard voorkomt een dubbele
   // aankondiging door React 18 StrictMode's dubbele effect-uitvoering in
   // development.
   useEffect(() => {
-    if (!pool || !identity || joinedRef.current) return;
+    if (!pool || !identity || !channelKey || joinedRef.current) return;
     joinedRef.current = true;
-    publishEvent(PRESENCE_JOIN_KIND, [
-      ['t', chatTag],
-      ['name', displayNameRef.current],
-    ]);
+    publishEvent(PRESENCE_JOIN_KIND, [['t', chatTag]], JSON.stringify({ name: displayNameRef.current }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pool, identity, chatTag]);
+  }, [pool, identity, chatTag, channelKey]);
 
   useEffect(() => {
     persistLocalList(`wsdocs:${channelId}`, docs);
@@ -789,8 +890,15 @@ function Dashboard({ channelId, pool }) {
     const signed = await publishEvent(CHAT_KIND, [['t', chatTag]], trimmed);
     if (signed) {
       seenRef.current.add(signed.id);
+      // signed.content is de versleutelde ciphertext die daadwerkelijk de
+      // deur uit ging; voor de eigen (optimistische) weergave tonen we
+      // gewoon de leesbare tekst die we al hadden, i.p.v. 'm eerst weer te
+      // moeten ontsleutelen.
+      const displayEvent = { ...signed, content: trimmed };
       setEntries((prev) =>
-        prev.some((e) => e.id === signed.id) ? prev : [...prev, { type: 'chat', id: signed.id, event: signed }].sort((a, b) => entryTime(a) - entryTime(b))
+        prev.some((e) => e.id === signed.id)
+          ? prev
+          : [...prev, { type: 'chat', id: signed.id, event: displayEvent }].sort((a, b) => entryTime(a) - entryTime(b))
       );
     }
   }
@@ -800,11 +908,7 @@ function Dashboard({ channelId, pool }) {
     if (!trimmed || trimmed === displayName) return;
     const oldName = displayName;
     setDisplayNameLocal(trimmed);
-    publishEvent(PRESENCE_RENAME_KIND, [
-      ['t', chatTag],
-      ['name', trimmed],
-      ['oldname', oldName],
-    ]);
+    publishEvent(PRESENCE_RENAME_KIND, [['t', chatTag]], JSON.stringify({ name: trimmed, oldname: oldName }));
   }
 
   function renameChannel(name) {
@@ -818,8 +922,8 @@ function Dashboard({ channelId, pool }) {
     });
     publishEvent(
       CHANNEL_META_KIND,
-      [['t', chatTag], ['d', channelMetaDTag], ['name', displayName]],
-      JSON.stringify({ name: trimmed })
+      [['t', chatTag], ['d', channelMetaDTag]],
+      JSON.stringify({ name: trimmed, authorName: displayName })
     );
   }
 
@@ -843,7 +947,7 @@ function Dashboard({ channelId, pool }) {
     setDocs(nextDocs);
     setActiveItem({ type: 'doc', id });
     publishEvent(DOCLIST_KIND, [['t', chatTag], ['d', docsDTag]], JSON.stringify(nextDocs));
-    publishEvent(DOC_CREATED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ docId: id, docName: name }));
+    publishEvent(DOC_CREATED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, docId: id, docName: name }));
   }
 
   function renameDocument(docId, newName) {
@@ -857,8 +961,8 @@ function Dashboard({ channelId, pool }) {
     publishEvent(DOCLIST_KIND, [['t', chatTag], ['d', docsDTag]], JSON.stringify(next));
     publishEvent(
       DOC_RENAMED_KIND,
-      [['t', chatTag], ['name', displayName]],
-      JSON.stringify({ docId, oldName: oldDoc.name, newName: trimmed })
+      [['t', chatTag]],
+      JSON.stringify({ name: displayName, docId, oldName: oldDoc.name, newName: trimmed })
     );
   }
 
@@ -866,12 +970,17 @@ function Dashboard({ channelId, pool }) {
   // navigeert erheen én publiceert een "geopend"-event, zodat iedereen een
   // klikbare "X heeft Y geopend"-regel in de chat krijgt.
   function openDocument(docId, docName) {
+    // Dit document is al de actieve view (bv. dubbelklik, of herhaald op
+    // dezelfde chatlink klikken): geen nieuw "geopend"-event, dat zou alleen
+    // onnodig relay-verkeer (en rate-limit-risico) opleveren voor iets dat
+    // al zichtbaar is.
+    if (activeItem?.type === 'doc' && activeItem.id === docId) return;
     setActiveItem({ type: 'doc', id: docId });
     // Zelfherstellend: als dit document lokaal nog niet bekend is (bv. de
     // documentenlijst-sync was nog niet binnen), toch meteen openbaar
     // maken zodat het icoon/de editor direct werkt.
     setDocs((prev) => (prev.some((d) => d.id === docId) ? prev : [...prev, { id: docId, name: docName || 'Document' }]));
-    publishEvent(DOC_OPENED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ docId, docName }));
+    publishEvent(DOC_OPENED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, docId, docName }));
   }
 
   // Video-oproep aanmaken: net als een document krijgt de oproep een eigen
@@ -887,7 +996,7 @@ function Dashboard({ channelId, pool }) {
     if (activeItem?.type !== 'call') preCallItemRef.current = activeItem;
     setActiveItem({ type: 'call', id });
     publishEvent(CALLLIST_KIND, [['t', chatTag], ['d', callsDTag]], JSON.stringify(nextCalls));
-    publishEvent(CALL_STARTED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ callId: id, callName: name }));
+    publishEvent(CALL_STARTED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, callId: id, callName: name }));
   }
 
   // Een bestaande video-oproep (weer) binnengaan — vanaf een bureaublad-
@@ -895,6 +1004,8 @@ function Dashboard({ channelId, pool }) {
   // "geopend"-event, zodat iedereen een klikbare "X heeft Y geopend"-regel
   // in de chat krijgt.
   function openCall(callId, callName) {
+    // Deze call is al de actieve fullscreen-view: geen nieuw event nodig.
+    if (activeItem?.type === 'call' && activeItem.id === callId) return;
     // Is deze call al gedockt (draait dus al op de achtergrond)? Dan gewoon
     // weer fullscreen tonen — geen nieuwe iframe, geen extra "geopend"-
     // event/chat-spam voor iets dat al liep.
@@ -908,7 +1019,7 @@ function Dashboard({ channelId, pool }) {
     setActiveItem({ type: 'call', id: callId });
     setDockedCall(null); // een eventuele andere gedockte call laten varen
     setCalls((prev) => (prev.some((c) => c.id === callId) ? prev : [...prev, { id: callId, name: callName || 'Video-oproep' }]));
-    publishEvent(CALL_OPENED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ callId, callName }));
+    publishEvent(CALL_OPENED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, callId, callName }));
   }
 
   // Minimaliseren: de call blijft (audio/verbinding) op de achtergrond
@@ -947,8 +1058,8 @@ function Dashboard({ channelId, pool }) {
     publishEvent(CALLLIST_KIND, [['t', chatTag], ['d', callsDTag]], JSON.stringify(next));
     publishEvent(
       CALL_RENAMED_KIND,
-      [['t', chatTag], ['name', displayName]],
-      JSON.stringify({ callId, oldName: oldCall.name, newName: trimmed })
+      [['t', chatTag]],
+      JSON.stringify({ name: displayName, callId, oldName: oldCall.name, newName: trimmed })
     );
   }
 
@@ -959,7 +1070,7 @@ function Dashboard({ channelId, pool }) {
     setDocs(next);
     setActiveItem((prev) => (prev?.type === 'doc' && prev.id === docId ? null : prev));
     publishEvent(DOCLIST_KIND, [['t', chatTag], ['d', docsDTag]], JSON.stringify(next));
-    publishEvent(DOC_DELETED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ docId, docName: doc?.name }));
+    publishEvent(DOC_DELETED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, docId, docName: doc?.name }));
   }
 
   function deleteCall(callId) {
@@ -969,7 +1080,7 @@ function Dashboard({ channelId, pool }) {
     setCalls(next);
     setActiveItem((prev) => (prev?.type === 'call' && prev.id === callId ? null : prev));
     publishEvent(CALLLIST_KIND, [['t', chatTag], ['d', callsDTag]], JSON.stringify(next));
-    publishEvent(CALL_DELETED_KIND, [['t', chatTag], ['name', displayName]], JSON.stringify({ callId, callName: call?.name }));
+    publishEvent(CALL_DELETED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, callId, callName: call?.name }));
   }
 
   function goToDesktop() {
