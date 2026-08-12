@@ -185,6 +185,18 @@ function mergeDocs(local, remote) {
 // subscriptie/NIP-33-addressering niet meer). De weergavenaam van de
 // afzender ('name'-tag in eerdere versies) zit daarom ook niet meer los
 // als tag, maar in de versleutelde content.
+//
+// Cruciaal hierbij: die 't'/'d'-tags mogen zelf NOOIT het kanaal-ID
+// letterlijk bevatten. Zouden ze dat wel doen (zoals in een eerdere versie
+// — `t = wschat-<channelId>`), dan kan iedereen die de relay afluistert de
+// tag aflezen, het vaste prefix wegstrippen, en met deze zelfde (publieke,
+// open-source) code de sleutel herberekenen — dan "beschermt" de
+// versleuteling alleen tegen wie toevallig niet doorheeft dat het
+// kanaal-ID gewoon in de tag verstopt zit. Daarom wordt hier een apart,
+// eenrichtings-afgeleid pseudoniem (SHA-256-hash) van het kanaal-ID
+// gebruikt voor alle publieke tags/adressering — dat verraadt niets over
+// het kanaal-ID zelf, terwijl de sleutel wél nog van het échte kanaal-ID
+// wordt afgeleid. Zie deriveChannelTag() hieronder.
 async function deriveChannelKey(channelId) {
   const encoder = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(channelId), 'HKDF', false, ['deriveKey']);
@@ -195,6 +207,18 @@ async function deriveChannelKey(channelId) {
     false,
     ['encrypt', 'decrypt']
   );
+}
+
+// Eenrichtings-pseudoniem van het kanaal-ID, gebruikt voor alles wat
+// publiek als tag over de relay gaat (chat-tag, NIP-33 'd'-tags, WebRTC-
+// signaling-room-tag). Een waarnemer ziet alleen deze hash, en kan daar
+// niet het kanaal-ID (en dus niet de content-sleutel) uit terugrekenen.
+// Los gehouden van deriveChannelKey (andere 'info'-string) zodat het
+// evident twee onafhankelijke afgeleiden zijn, ook al is de invoer gelijk.
+async function deriveChannelTag(channelId) {
+  const encoder = new TextEncoder();
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(`community-workspace-tag-v1:${channelId}`));
+  return bytesToHex(new Uint8Array(digest)).slice(0, 32);
 }
 
 function bytesToBase64(bytes) {
@@ -332,18 +356,37 @@ function useDisplayName() {
 function useDocumentSync(pool, identity, channelId, docs) {
   const instancesRef = useRef(new Map()); // docId -> { ydoc, idbPersistence, provider }
   const [, forceRender] = useState(0);
+  // Eenrichtings-pseudoniem van channelId (zie deriveChannelTag) — gebruikt
+  // voor de WebRTC-signaling-'t'-tag, die net als chatTag/docsDTag publiek
+  // over de relay gaat en dus nooit het rauwe channelId mag prijsgeven.
+  const [channelTag, setChannelTag] = useState(null);
 
   useEffect(() => {
-    if (!pool || !identity) return;
+    let cancelled = false;
+    deriveChannelTag(channelId).then((tag) => {
+      if (!cancelled) setChannelTag(tag);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [channelId]);
+
+  useEffect(() => {
+    if (!pool || !identity || !channelTag) return;
     let changed = false;
     const currentIds = new Set(docs.map((d) => d.id));
 
     docs.forEach((doc) => {
       if (instancesRef.current.has(doc.id)) return;
-      const roomName = `wsdoc-${channelId}-${doc.id}`;
+      // Lokale IndexedDB-naam: blijft gewoon het rauwe channelId, want die
+      // komt nooit over het netwerk — puur een lokale opslagsleutel.
+      const localName = `wsdoc-${channelId}-${doc.id}`;
+      // Publieke Nostr-'t'-tag voor de WebRTC-signaling: het pseudoniem,
+      // niet het rauwe channelId (zie deriveChannelTag hierboven).
+      const roomTag = `wsdoc-${channelTag}-${doc.id}`;
       const ydoc = new Y.Doc();
-      const idbPersistence = new IndexeddbPersistence(roomName, ydoc);
-      const provider = new NostrWebrtcProvider(roomName, ydoc, { pool, relays: RELAYS, identity });
+      const idbPersistence = new IndexeddbPersistence(localName, ydoc);
+      const provider = new NostrWebrtcProvider(roomTag, ydoc, { pool, relays: RELAYS, identity });
       instancesRef.current.set(doc.id, { ydoc, idbPersistence, provider });
       changed = true;
     });
@@ -361,7 +404,7 @@ function useDocumentSync(pool, identity, channelId, docs) {
     });
 
     if (changed) forceRender((n) => n + 1);
-  }, [pool, identity, channelId, docs]);
+  }, [pool, identity, channelId, channelTag, docs]);
 
   // Volledige opruiming bij het verlaten van dit kanaal (Dashboard
   // remount). Effect zonder deps + lege cleanup-registratie: draait maar
@@ -464,10 +507,18 @@ function Dashboard({ channelId, pool }) {
   // document. Zie useDocumentSync hierboven voor het waarom.
   const docSyncInstances = useDocumentSync(pool, identity, channelId, docs);
 
-  const chatTag = `wschat-${channelId}`;
-  const docsDTag = `wsdocs-${channelId}`;
-  const callsDTag = `wscalls-${channelId}`;
-  const channelMetaDTag = `wschannel-${channelId}`;
+  // channelTag: het eenrichtings-pseudoniem van channelId (zie
+  // deriveChannelTag), ná gebruikt voor élke publieke tag/adressering.
+  // Vóór het laden is dit nog null — de tags hieronder verwijzen dan
+  // tijdelijk naar 'wschat-null' e.d., maar dat is onschadelijk: elke
+  // plek die deze tags gebruikt om te publiceren/abonneren wacht al op
+  // channelKey (zie channelKeyRef-check in publishEvent en de guard in de
+  // subscriptie-effect hieronder), die pas tegelijk met channelTag klaar is.
+  const [channelTag, setChannelTag] = useState(null);
+  const chatTag = `wschat-${channelTag}`;
+  const docsDTag = `wsdocs-${channelTag}`;
+  const callsDTag = `wscalls-${channelTag}`;
+  const channelMetaDTag = `wschannel-${channelTag}`;
 
   const seenRef = useRef(new Set());
   const joinedRef = useRef(false);
@@ -490,10 +541,15 @@ function Dashboard({ channelId, pool }) {
 
   useEffect(() => {
     let cancelled = false;
-    deriveChannelKey(channelId).then((key) => {
+    // Beide afgeleiden van hetzelfde channelId, maar met een eigen
+    // 'info'/domein-string (zie deriveChannelKey/deriveChannelTag) — de
+    // publieke tag (channelTag) mag nooit gebruikt kunnen worden om de
+    // geheime content-sleutel (channelKey) te reconstrueren.
+    Promise.all([deriveChannelKey(channelId), deriveChannelTag(channelId)]).then(([key, tag]) => {
       if (cancelled) return;
       channelKeyRef.current = key;
       setChannelKey(key);
+      setChannelTag(tag);
     });
     return () => {
       cancelled = true;

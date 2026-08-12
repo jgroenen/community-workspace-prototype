@@ -80,11 +80,27 @@ kanaal-URL (dus de `#<kanaal-id>` in de hash) kan zo lezen én schrijven;
 relays en toevallige meelezers zien alleen AES-GCM-ciphertext (IV +
 versleutelde bytes, base64). Alleen de tags die de relay zelf nodig heeft
 om events te kunnen filteren/adresseren (`t`, `d`, `p`) blijven
-onversleuteld — die bevatten geen inhoudelijke informatie, enkel
-kanaal-/document-/peer-identifiers. Dit is aparte, symmetrische
-versleuteling naast de NIP-04-versleuteling die al voor de
-WebRTC-signaling (SDP/ICE) werd gebruikt, die zit achter de identity-sleutel
-van elke peer.
+onversleuteld.
+
+Belangrijk: die tags bevatten daarom bewust **niet** het kanaal-ID zelf,
+maar een eenrichtings-hash ervan (`deriveChannelTag()` in App.jsx, SHA-256
+met een eigen domein-string — losstaand van `deriveChannelKey()`, ook al is
+de invoer gelijk). Zou de tag wél het kanaal-ID letterlijk bevatten (zoals
+in een eerdere versie van deze app), dan kan iedereen die de relay
+afluistert dat aflezen en met deze zelfde open-source code de
+content-sleutel herberekenen — dan is de versleuteling alleen bescherming
+tegen wie toevallig niet doorheeft dat het kanaal-ID in de tag verstopt
+zit, niet tegen een relay-operator die het weet. Met de hash kan een
+waarnemer events nog steeds filteren/matchen op kanaal, maar niet
+terugrekenen naar het kanaal-ID (en dus niet naar de sleutel) — dat kan
+alleen wie de kanaal-URL zelf heeft. Dezelfde pseudonimisering geldt voor
+de WebRTC-documentsync-room-tag (`wsdoc-<hash>-<doc-id>`, zie
+`useDocumentSync`); alleen de lokale IndexedDB-opslagnaam gebruikt nog het
+rauwe kanaal-ID, want die verlaat de browser nooit.
+
+Dit is aparte, symmetrische versleuteling naast de NIP-04-versleuteling die
+al voor de WebRTC-signaling (SDP/ICE) werd gebruikt, die zit achter de
+identity-sleutel van elke peer.
 
 ## Hoe het werkt
 
