@@ -452,6 +452,145 @@ function useChannelId() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Achtergrond-notificaties voor niet-actieve opgeslagen kanalen       */
+/* ------------------------------------------------------------------ */
+
+// Welke event-kinds een achtergrondmelding waard zijn, en onder welke
+// categorie ze in de badge meetellen. Bewust een kleine, vaste
+// deelverzameling: geen documentsync (useDocumentSync draait WebRTC per
+// document — te duur om voor élk opgeslagen kanaal tegelijk te laten
+// lopen) en geen content-decryptie (niet nodig voor een telling, en
+// scheelt AES-GCM-werk voor kanalen die je toch niet actief volgt — de
+// kind zelf zit altijd onversleuteld in het event, alleen de content niet).
+const NOTIFICATION_KIND_CATEGORY = {
+  [CHAT_KIND]: 'message',
+  [PRESENCE_JOIN_KIND]: 'presence',
+  [DOC_CREATED_KIND]: 'doc',
+  [DOC_OPENED_KIND]: 'doc',
+  [CALL_STARTED_KIND]: 'call',
+};
+
+// Houdt voor elk opgeslagen kanaal — behalve het kanaal dat nu actief open
+// staat, dat krijgt al de volledige live behandeling via Dashboard — een
+// lichte achtergrond-subscriptie bij. Eén gecombineerde subscriptie voor
+// alle gevolgde kanalen tegelijk (één '#t'-filter met alle tags erin), dus
+// dit blijft ook met tientallen opgeslagen kanalen licht.
+function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey) {
+  const [notifications, setNotifications] = useState({});
+  // channelId -> channelTag (het eenrichtings-pseudoniem, zie deriveChannelTag)
+  const tagByChannelRef = useRef(new Map());
+  // volledige 't'-tagwaarde -> channelId, om bij een binnenkomend event
+  // (dat alleen de tag draagt, niet het channelId zelf) de bron terug te
+  // vinden.
+  const channelByTagRef = useRef(new Map());
+  const subRef = useRef(null);
+  // channelId -> vanaf welk moment (unix-seconden) events voor dát kanaal
+  // meetellen. Bewust per kanaal i.p.v. één globale "since": zonder dit zou
+  // een kanaal dat je zojuist hebt verlaten in één klap zijn hele
+  // geschiedenis-sinds-het-opstarten-van-de-app "herontdekken" zodra de
+  // subscriptie 'm weer meeneemt — inclusief bijvoorbeeld je eigen
+  // presence-join-event van toen je het net opende. Wordt gezet zodra een
+  // kanaal voor het eerst in de watchlist verschijnt, én opnieuw
+  // opgeschoven naar "nu" door clearChannel() zodra je het weer opent.
+  const channelSinceRef = useRef(new Map());
+  // Dezelfde relay levert hetzelfde event maar via meerdere relays tegelijk
+  // af (elke relay-verbinding roept onevent apart aan) — zonder dedup op
+  // event-id telt één bericht dus 2-3x mee. Zelfde patroon als seenRef in
+  // Dashboard.
+  const seenRef = useRef(new Set());
+
+  // activeChannelId is bij de allereerste render nog even null (vóórdat
+  // useChannelId de URL-hash heeft uitgelezen) — behandel dat expliciet als
+  // "nog niets volgen" i.p.v. per ongeluk ook het straks-actieve kanaal in
+  // de watchlist te zetten. Zonder deze guard kan er in dat korte venster
+  // een subscriptie ontstaan die het eigen kanaal meetelt, met een badge op
+  // je eigen open kanaal tot gevolg.
+  const watchIds = activeChannelId
+    ? savedChannels.map((c) => c.id).filter((id) => id !== activeChannelId)
+    : [];
+  // Stabiele string-key zodat het effect hieronder alleen opnieuw draait
+  // als de sét te volgen kanalen echt verandert, niet bij elke render.
+  const watchKey = watchIds.slice().sort().join(',');
+
+  useEffect(() => {
+    if (!pool || watchIds.length === 0) return;
+    let cancelled = false;
+
+    (async () => {
+      const tags = [];
+      let minSince = null;
+      for (const id of watchIds) {
+        let tag = tagByChannelRef.current.get(id);
+        if (!tag) {
+          tag = await deriveChannelTag(id);
+          if (cancelled) return;
+          tagByChannelRef.current.set(id, tag);
+          channelByTagRef.current.set(`wschat-${tag}`, id);
+        }
+        if (!channelSinceRef.current.has(id)) {
+          channelSinceRef.current.set(id, Math.floor(Date.now() / 1000));
+        }
+        const since = channelSinceRef.current.get(id);
+        if (minSince === null || since < minSince) minSince = since;
+        tags.push(`wschat-${tag}`);
+      }
+      if (cancelled || tags.length === 0) return;
+
+      // since hierin is bewust de ruimste (vroegste) grens over alle
+      // gevolgde kanalen — een veilige ondergrens richting de relay. De
+      // exacte, per-kanaal grens wordt hieronder in onevent() gehandhaafd.
+      subRef.current = pool.subscribeMany(
+        RELAYS,
+        {
+          kinds: Object.keys(NOTIFICATION_KIND_CATEGORY).map(Number),
+          '#t': tags,
+          since: minSince,
+        },
+        {
+          onevent(event) {
+            if (seenRef.current.has(event.id)) return;
+            seenRef.current.add(event.id);
+            const tTag = event.tags.find((t) => t[0] === 't')?.[1];
+            const sourceChannelId = tTag && channelByTagRef.current.get(tTag);
+            const category = NOTIFICATION_KIND_CATEGORY[event.kind];
+            if (!sourceChannelId || !category) return;
+            if (event.pubkey === myPubkey) return;
+            const watchedSince = channelSinceRef.current.get(sourceChannelId);
+            if (watchedSince != null && event.created_at < watchedSince) return;
+            setNotifications((prev) => {
+              const current = prev[sourceChannelId] ?? { message: 0, doc: 0, call: 0, presence: 0 };
+              return { ...prev, [sourceChannelId]: { ...current, [category]: current[category] + 1 } };
+            });
+          },
+        }
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+      subRef.current?.close();
+      subRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool, watchKey, myPubkey]);
+
+  function clearChannel(id) {
+    // Schuift de since-cursor van dit kanaal op naar nu: verlaat je het
+    // straks weer, dan telt alleen wat er ná dit moment gebeurt nog mee —
+    // niet alles wat al (opnieuw) geleerd was vóór je het nu opende.
+    channelSinceRef.current.set(id, Math.floor(Date.now() / 1000));
+    setNotifications((prev) => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  return { notifications, clearChannel };
+}
+
+/* ------------------------------------------------------------------ */
 /*  App root                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -459,6 +598,30 @@ export default function App() {
   const channelId = useChannelId();
   const poolRef = useRef(null);
   if (!poolRef.current) poolRef.current = new SimplePool();
+  // Ook hier (naast in Dashboard) opgevraagd: dezelfde, localStorage-
+  // gebaseerde identiteit (of NIP-07-extensie), puur om straks eigen
+  // events te kunnen herkennen en uitsluiten van notificaties — zie
+  // useChannelNotifications hieronder.
+  const identity = useNostrIdentity();
+
+  // savedChannels leeft hier (in App), niet in Dashboard: Dashboard wordt
+  // via key={channelId} volledig opnieuw opgebouwd bij elke kanaalwissel,
+  // maar de achtergrond-notificatie-subscriptie hieronder moet juist over
+  // zo'n wissel heen blijven bestaan.
+  const [savedChannels, setSavedChannels] = useState(loadSavedChannels);
+  const { notifications, clearChannel } = useChannelNotifications(
+    poolRef.current,
+    savedChannels,
+    channelId,
+    identity?.pubkey
+  );
+
+  // Zodra je een kanaal echt opent, is de achtergrondmelding daarvoor
+  // achterhaald (je ziet het nu toch al live in Dashboard) — badge wissen.
+  useEffect(() => {
+    if (channelId) clearChannel(channelId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelId]);
 
   useEffect(() => {
     return () => {
@@ -476,17 +639,25 @@ export default function App() {
 
   // key={channelId} laat de volledige dashboard (incl. alle Nostr/Yjs
   // abonnementen) schoon opnieuw opbouwen wanneer je van kanaal wisselt.
-  return <Dashboard key={channelId} channelId={channelId} pool={poolRef.current} />;
+  return (
+    <Dashboard
+      key={channelId}
+      channelId={channelId}
+      pool={poolRef.current}
+      savedChannels={savedChannels}
+      setSavedChannels={setSavedChannels}
+      notifications={notifications}
+    />
+  );
 }
 
 /* ------------------------------------------------------------------ */
 /*  Dashboard: bevat het volledige split-screen                        */
 /* ------------------------------------------------------------------ */
 
-function Dashboard({ channelId, pool }) {
+function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notifications }) {
   const identity = useNostrIdentity();
   const [displayName, setDisplayNameLocal] = useDisplayName();
-  const [savedChannels, setSavedChannels] = useState(loadSavedChannels);
   const [menuOpen, setMenuOpen] = useState(false);
   const [docs, setDocs] = useState(() => loadLocalList(`wsdocs:${channelId}`));
   const [calls, setCalls] = useState(() => loadLocalList(`wscalls:${channelId}`));
@@ -1161,6 +1332,7 @@ function Dashboard({ channelId, pool }) {
         channelName={channelName}
         onRenameChannel={renameChannel}
         savedChannels={savedChannels}
+        notifications={notifications}
         menuOpen={menuOpen}
         onToggleMenu={() => setMenuOpen((v) => !v)}
         onCloseMenu={() => setMenuOpen(false)}
@@ -1287,6 +1459,7 @@ function ChatPanel({
   channelName,
   onRenameChannel,
   savedChannels,
+  notifications,
   menuOpen,
   onToggleMenu,
   onCloseMenu,
@@ -1345,6 +1518,11 @@ function ChatPanel({
     else setDisplayNameDraft(displayName);
   }
 
+  const totalUnread = Object.values(notifications).reduce(
+    (sum, n) => sum + n.message + n.doc + n.call + n.presence,
+    0
+  );
+
   return (
     <div className="w-1/2 h-full flex flex-col bg-white border-r border-slate-200">
       {/* Kanaalheader */}
@@ -1352,11 +1530,18 @@ function ChatPanel({
         <div className="flex items-center gap-1 min-w-0 relative" ref={menuRef}>
           <button
             onClick={onToggleMenu}
-            className="flex items-center gap-0.5 shrink-0 rounded hover:bg-slate-100 p-1 -m-1"
-            title="Opgeslagen werkruimtes"
+            className="relative flex items-center gap-0.5 shrink-0 rounded hover:bg-slate-100 p-1 -m-1"
+            title={
+              totalUnread > 0
+                ? `Opgeslagen werkruimtes (${totalUnread} nieuw in andere kanalen)`
+                : 'Opgeslagen werkruimtes'
+            }
           >
             <span className="text-lg leading-none">💬</span>
             <span className="text-[10px] text-slate-400 leading-none">▾</span>
+            {totalUnread > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500" />
+            )}
           </button>
           {editingName ? (
             <input
@@ -1391,18 +1576,37 @@ function ChatPanel({
               {savedChannels.length === 0 && (
                 <div className="p-3 text-xs text-slate-400">Nog geen opgeslagen kanalen.</div>
               )}
-              {savedChannels.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => onSelectChannel(c.id)}
-                  className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 ${
-                    c.id === channelId ? 'bg-indigo-50 font-medium' : ''
-                  }`}
-                >
-                  <div className="truncate">{c.name}</div>
-                  <div className="truncate text-[10px] text-slate-400">{c.id}</div>
-                </button>
-              ))}
+              {savedChannels.map((c) => {
+                const n = notifications[c.id];
+                const unread = n ? n.message + n.doc + n.call + n.presence : 0;
+                const parts = [];
+                if (n?.message) parts.push(`${n.message} bericht${n.message > 1 ? 'en' : ''}`);
+                if (n?.doc) parts.push(`${n.doc} document${n.doc > 1 ? 'actie' : ''}`);
+                if (n?.call) parts.push(`${n.call} video-oproep${n.call > 1 ? 'en' : ''}`);
+                if (n?.presence) parts.push(`${n.presence}x iemand online gekomen`);
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => onSelectChannel(c.id)}
+                    className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 flex items-center justify-between gap-2 ${
+                      c.id === channelId ? 'bg-indigo-50 font-medium' : ''
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate">{c.name}</div>
+                      <div className="truncate text-[10px] text-slate-400">{c.id}</div>
+                    </div>
+                    {unread > 0 && (
+                      <span
+                        className="shrink-0 inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold"
+                        title={parts.join(', ')}
+                      >
+                        {unread > 9 ? '9+' : unread}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
