@@ -1,0 +1,144 @@
+# Community Workspace
+
+Gedecentraliseerde, local-first community workspace: permanent split-screen
+met links een Nostr-chatkanaal en rechts een "bureaublad" vol collaboratieve
+BlockNote/Yjs-documenten en P2P-videobelgesprekken.
+
+## Snel starten
+
+```bash
+npm install
+npm run dev
+```
+
+Bezoek `http://localhost:5173/` — je wordt automatisch doorgestuurd naar een
+nieuw, willekeurig gegenereerd kanaal (`/#<kanaal-id>`). Deel die URL met
+anderen om samen te chatten en te werken. Er is geen backend, database of
+signaling-server nodig — alles (chat, presence, documenten-/video-
+oproepenlijst, kanaal- en gebruikersnaam, én de WebRTC-verbindingsopzet voor
+de editor) loopt via publieke Nostr-relays, en elk document wordt daarnaast
+lokaal in de browser bewaard (IndexedDB).
+
+## Hosten op GitHub Pages
+
+Deze app is 100% client-side (geen backend) en dus rechtstreeks te hosten
+als statische site. `node_modules/` en `dist/` staan bewust niet in git
+([.gitignore](.gitignore)) — GitHub Pages heeft die ook niet nodig, het
+serveert alleen de **gebouwde** bestanden.
+
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) bouwt de app
+automatisch (`npm ci && npm run build`) en publiceert `dist/` naar GitHub
+Pages bij elke push naar `main`. Eenmalig instellen:
+
+1. Push deze repo naar GitHub.
+2. Ga naar **Settings → Pages** en zet **Source** op **GitHub Actions**.
+3. Bij de volgende push naar `main` verschijnt de site op
+   `https://<gebruiker>.github.io/<repo-naam>/`.
+
+`vite.config.js` gebruikt bewust relatieve asset-paden (`base: './'`), dus
+dit werkt ongeacht onder welk subpad de repo gehost wordt. De app routeert
+via de URL-hash (`#<kanaal-id>`), niet via losse paden, dus er is geen
+server-side rewrite nodig voor deep links — precies wat statische hosting
+zoals GitHub Pages wél en een pad-gebaseerde SPA-router niet vanzelf heeft.
+
+## Architectuurprincipe
+
+Elke toestandsverandering die andere deelnemers moeten meekrijgen, gaat als
+Nostr-event het kanaal in — er is geen los kanaal (websocket, aparte API)
+voor "app-events". Zie de constanten bovenaan [src/App.jsx](src/App.jsx)
+voor het overzicht van alle gebruikte event-kinds:
+
+| kind | betekenis | type |
+|---|---|---|
+| 1 | chatbericht | regulier, blijft bewaard |
+| 1977 | document aangemaakt | regulier, blijft bewaard — klikbare link in chat |
+| 1978 | document geopend | regulier, blijft bewaard — klikbare link in chat |
+| 1979 | document hernoemd | regulier, blijft bewaard — klikbare link in chat |
+| 1980 | video-oproep gestart | regulier, blijft bewaard — klikbare link in chat |
+| 20077 | gebruiker kwam binnen | ephemeral |
+| 20078 | gebruiker hernoemd | ephemeral |
+| 20090 | WebRTC-peer aanwezig (announce) | ephemeral |
+| 20091 | WebRTC-signaal (SDP/ICE), NIP-04-versleuteld | ephemeral |
+| 30078 | documentenlijst | NIP-33, vervangbaar |
+| 30079 | kanaalnaam | NIP-33, vervangbaar |
+| 30080 | video-oproepenlijst | NIP-33, vervangbaar |
+
+Publiceren gaat altijd via de centrale `publishEvent()`-helper in
+`Dashboard` (App.jsx), zodat sign/publish/foutafhandeling overal identiek
+is. Eén gecombineerde Nostr-subscriptie per kanaal routeert elk
+binnenkomend event op basis van zijn `kind` naar de juiste plek in de
+UI-state.
+
+## Hoe het werkt
+
+- **Kanaal-routing**: het kanaal-ID zit in de URL-hash. Geen hash → er wordt
+  automatisch een cryptografisch willekeurige hex-ID gegenereerd
+  (`useChannelId` in App.jsx).
+- **Opgeslagen werkruimtes**: elk bezocht kanaal wordt met een naam in
+  `localStorage` bewaard. Klik op de kanaalnaam linksboven om 'm te
+  hernoemen (publiceert een kind-30079-event, zichtbaar voor iedereen in het
+  kanaal); klik op "📂 Werkruimtes" om terug te springen naar een eerder
+  kanaal.
+- **Nostr-chat**: berichten zijn `kind 1`-events getagd met
+  `t = wschat-<kanaal-id>`, gepubliceerd/opgehaald via `nostr-tools`
+  (`SimplePool`) op `relay.damus.io`, `nos.lol` en `relay.nostr.band`. Zonder
+  NIP-07-extensie (zoals Alby) wordt automatisch een ephemeral sleutelpaar
+  gegenereerd en lokaal bewaard.
+- **Presence**: bij binnenkomst en bij een naamswijziging (👤-knop
+  onderaan de chat) verschijnt een systeembericht bij alle andere
+  deelnemers.
+- **Werkscherm-bureaublad**: het rechterpaneel start altijd op een
+  "bureaublad" met iconen — "Nieuw document", "Nieuwe video-oproep", en
+  daaronder elk al bestaand document/elke bestaande oproep. Een kanaal start
+  bewust leeg; pas als iemand iets aanmaakt, gaat het bijbehorende event
+  (documenten-/oproepenlijst + een klikbare "X heeft ... aangemaakt"-link in
+  de chat) het kanaal in en verschijnt het icoon ook bij andere deelnemers.
+  Een geopend document/oproep krijgt een eigen kop met ✕ om terug te gaan.
+- **Klikbare activiteitenlinks in de chat**: aanmaken, openen en hernoemen
+  van documenten, en het starten van een video-oproep, verschijnen als
+  klikbare pills tussen de chatberichten (bv. "Johan heeft 'Notities'
+  hernoemd naar 'Actiepunten'"). Klikken opent meteen het betreffende
+  document of dezelfde video-oproep-kamer.
+- **Collaboratieve editor**: BlockNoteJS + Yjs. Voor élk document in de
+  workspace draait continu een achtergrond-syncsetje
+  (`useDocumentSync` in App.jsx) — niet alleen voor het geopende document:
+  - `IndexeddbPersistence` bewaart de inhoud lokaal in de browser, dus die
+    overleeft een herlaad ook zonder dat er een andere peer online is.
+  - een eigen `NostrWebrtcProvider` ([src/nostrWebrtc.js](src/nostrWebrtc.js))
+    synchroniseert live P2P met andere online deelnemers.
+  Zo blijft ieder document continu gesynchroniseerd tussen alle actieve
+  peers, ook als niemand het er net open heeft staan.
+- **Video-oproepen**: elke oproep krijgt een eigen, willekeurig ID (net als
+  documenten) en dus een stabiele, altijd opnieuw te bereiken kamer bij
+  `videobellen.pleio.nl/<kanaal-id>-<oproep-id>` — een zelfgehoste Jitsi
+  Meet-instantie. De chat links blijft actief tijdens een gesprek.
+
+## WebRTC-signaling via Nostr (geen aparte infra)
+
+De collaboratieve editor gebruikt WebRTC om documentwijzigingen direct
+tussen browsers te synchroniseren (peer-to-peer, geen server ziet de
+inhoud). Om zo'n verbinding op te zetten moeten twee peers eerst een SDP-
+offer/answer uitwisselen ("signaling") — normaal gesproken via een aparte
+signaling-server. Deze app gebruikt daarvoor gewoon dezelfde Nostr-relays
+als de rest van de app:
+
+- `kind 20090` — "ik ben aanwezig in deze documentroom" (announce).
+- `kind 20091` — het eigenlijke SDP/ICE-signaal, **NIP-04-versleuteld** en
+  via een `p`-tag gericht aan één specifieke peer (SDP bevat lokale
+  netwerk-IP's, die wil je niet in platte tekst op een publieke relay
+  zetten).
+
+Wie de verbinding initieert wordt deterministisch bepaald (laagste pubkey
+initieert) zodat twee peers nooit gelijktijdig een offer sturen. Het
+CRDT-sync- en awareness-protocol (cursors/selecties) is overgenomen van
+`y-webrtc` (via de `y-protocols`-bibliotheek) — alleen de signaling-
+transportlaag is vervangen. Zie de uitgebreide toelichting bovenin
+[src/nostrWebrtc.js](src/nostrWebrtc.js).
+
+## Techstack
+
+React 18 (Vite) · Tailwind CSS · `nostr-tools` (incl. NIP-04) · `yjs` +
+`y-indexeddb` (lokale persistentie) + `y-protocols` + `simple-peer` (eigen
+Nostr-signaling, zie boven) · `@blocknote/core` + `@blocknote/react` +
+`@blocknote/mantine` · Jitsi Meet (iframe naar `videobellen.pleio.nl`, geen
+extra dependency nodig).

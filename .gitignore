@@ -1,0 +1,19 @@
+# Dependencies — geïnstalleerd via `npm install`, hoeven niet in git.
+node_modules/
+
+# Build-output — gegenereerd via `npm run build`; de GitHub Actions-workflow
+# bouwt en deployt dit automatisch, dus dit hoeft niet in de repo te staan.
+dist/
+
+# Vite's eigen dependency-cache
+.vite/
+node_modules/.vite/
+
+# Lokale env-overrides (bv. VITE_SIGNALING_SERVERS, mocht je die ooit weer
+# toevoegen) — nooit committen, kan per omgeving verschillen.
+.env
+.env.local
+
+# Editor/OS
+.DS_Store
+*.log
