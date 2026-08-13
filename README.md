@@ -115,14 +115,19 @@ identity-sleutel van elke peer.
 - **Achtergrond-notificaties voor andere kanalen**: naast het kanaal dat je
   nu open hebt, houdt `useChannelNotifications` (App.jsx) voor élk opgeslagen
   kanaal een lichte achtergrond-subscriptie bij — alleen de metadata-kinds
-  (chatbericht, presence, document/oproep aangemaakt of geopend), zónder de
-  zware WebRTC-documentsync die alleen het actieve kanaal krijgt. Activiteit
-  in een niet-geopend kanaal geeft een rood bolletje/teller in "Opgeslagen
-  werkruimtes"; die verdwijnt zodra je het kanaal echt opent. Eigen acties
-  tellen bewust niet mee (gefilterd op eigen pubkey), en elk kanaal heeft
-  een eigen since-cursor (pas actief vanaf het moment dat je het verlaat) —
-  anders zou je bij het wisselen van kanaal steeds je eigen recente
-  presence-join opnieuw als melding terugkrijgen.
+  (chatbericht, presence, document/oproep aangemaakt of geopend, video-oproep
+  gestart of geopend), zónder de zware WebRTC-documentsync die alleen het
+  actieve kanaal krijgt. Activiteit in een niet-geopend kanaal geeft een rood
+  bolletje/teller op het "Opgeslagen werkruimtes"-menu-icoon, plus een
+  tijdelijke (6s) toast-popup op precies dezelfde plek en in dezelfde stijl
+  als het "Opgeslagen kanalen"-dropdownmenu zelf — met de daadwerkelijk
+  ontsleutelde inhoud, in exact dezelfde formulering als de permanente
+  pills/systeemberichten in de chat-tijdlijn (dus geen aparte, net-even-
+  anders geformuleerde notificatietekst). Beide verdwijnen zodra je het
+  kanaal echt opent. Eigen acties tellen bewust niet mee (gefilterd op eigen
+  pubkey), en elk kanaal heeft een eigen since-cursor (pas actief vanaf het
+  moment dat je het verlaat) — anders zou je bij het wisselen van kanaal
+  steeds je eigen recente presence-join opnieuw als melding terugkrijgen.
 - **Nostr-chat**: berichten zijn `kind 1`-events getagd met
   `t = wschat-<kanaal-id>`, gepubliceerd/opgehaald via `nostr-tools`
   (`SimplePool`) op `relay.damus.io`, `nos.lol` en `relay.nostr.band`. Zonder

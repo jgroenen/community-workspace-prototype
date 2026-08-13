@@ -468,6 +468,7 @@ const NOTIFICATION_KIND_CATEGORY = {
   [DOC_CREATED_KIND]: 'doc',
   [DOC_OPENED_KIND]: 'doc',
   [CALL_STARTED_KIND]: 'call',
+  [CALL_OPENED_KIND]: 'call',
 };
 
 // Houdt voor elk opgeslagen kanaal — behalve het kanaal dat nu actief open
@@ -475,10 +476,43 @@ const NOTIFICATION_KIND_CATEGORY = {
 // lichte achtergrond-subscriptie bij. Eén gecombineerde subscriptie voor
 // alle gevolgde kanalen tegelijk (één '#t'-filter met alle tags erin), dus
 // dit blijft ook met tientallen opgeslagen kanalen licht.
+// Zet een gedecodeerd notificatie-event om naar een leesbare regel + wie
+// 'm deed, voor de toast-popup. Bewust letterlijk dezelfde formulering als
+// de permanente pills/systeemberichten in de chat-tijdlijn zelf (zie de
+// 'doclink'/'calllink'-rendering en de PRESENCE_JOIN_KIND-case verderop in
+// Dashboards eigen switch-statement) — dit is hetzelfde event, dus geen
+// aparte, net-even-anders geformuleerde notificatietekst.
+function describeNotificationEvent(kind, decrypted) {
+  if (kind === CHAT_KIND) {
+    return { authorName: null, line: decrypted };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(decrypted);
+  } catch {
+    return null;
+  }
+  const authorName = parsed.name ?? 'Iemand';
+  if (kind === PRESENCE_JOIN_KIND) return { authorName, line: 'is de chat binnengekomen' };
+  if (kind === DOC_CREATED_KIND) return { authorName, line: `heeft "${parsed.docName}" aangemaakt` };
+  if (kind === DOC_OPENED_KIND) return { authorName, line: `heeft "${parsed.docName}" geopend` };
+  if (kind === CALL_STARTED_KIND) return { authorName, line: `heeft video-oproep "${parsed.callName}" gestart` };
+  if (kind === CALL_OPENED_KIND) return { authorName, line: `heeft video-oproep "${parsed.callName}" geopend` };
+  return null;
+}
+
+// Hoe lang een toast-popup zichtbaar blijft voordat 'm vanzelf verdwijnt.
+const TOAST_DURATION_MS = 6000;
+
 function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey) {
   const [notifications, setNotifications] = useState({});
+  const [toasts, setToasts] = useState([]);
+  const toastTimersRef = useRef(new Map());
   // channelId -> channelTag (het eenrichtings-pseudoniem, zie deriveChannelTag)
   const tagByChannelRef = useRef(new Map());
+  // channelId -> AES-sleutel (zie deriveChannelKey) — nodig om de content
+  // van een binnenkomend event te kunnen ontsleutelen voor de toast-tekst.
+  const channelKeyByIdRef = useRef(new Map());
   // volledige 't'-tagwaarde -> channelId, om bij een binnenkomend event
   // (dat alleen de tag draagt, niet het channelId zelf) de bron terug te
   // vinden.
@@ -527,6 +561,11 @@ function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey)
           tagByChannelRef.current.set(id, tag);
           channelByTagRef.current.set(`wschat-${tag}`, id);
         }
+        if (!channelKeyByIdRef.current.has(id)) {
+          const key = await deriveChannelKey(id);
+          if (cancelled) return;
+          channelKeyByIdRef.current.set(id, key);
+        }
         if (!channelSinceRef.current.has(id)) {
           channelSinceRef.current.set(id, Math.floor(Date.now() / 1000));
         }
@@ -547,7 +586,7 @@ function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey)
           since: minSince,
         },
         {
-          onevent(event) {
+          async onevent(event) {
             if (seenRef.current.has(event.id)) return;
             seenRef.current.add(event.id);
             const tTag = event.tags.find((t) => t[0] === 't')?.[1];
@@ -561,6 +600,30 @@ function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey)
               const current = prev[sourceChannelId] ?? { message: 0, doc: 0, call: 0, presence: 0 };
               return { ...prev, [sourceChannelId]: { ...current, [category]: current[category] + 1 } };
             });
+
+            // Toast-popup met de daadwerkelijke (ontsleutelde) inhoud — puur
+            // best-effort: lukt ontsleutelen/parsen niet (corrupte payload,
+            // sleutel nog niet klaar), dan telt de badge hierboven al mee en
+            // slaan we gewoon de toast over.
+            const key = channelKeyByIdRef.current.get(sourceChannelId);
+            if (!key) return;
+            let decrypted;
+            try {
+              decrypted = await decryptContent(key, event.content);
+            } catch {
+              return;
+            }
+            const described = describeNotificationEvent(event.kind, decrypted);
+            if (!described || !described.line) return;
+            const channelName =
+              savedChannels.find((c) => c.id === sourceChannelId)?.name ?? `Kanaal ${sourceChannelId.slice(0, 6)}`;
+            const toastId = event.id;
+            setToasts((prev) => [...prev, { id: toastId, channelId: sourceChannelId, channelName, ...described }]);
+            const timer = setTimeout(() => {
+              setToasts((prev) => prev.filter((t) => t.id !== toastId));
+              toastTimersRef.current.delete(toastId);
+            }, TOAST_DURATION_MS);
+            toastTimersRef.current.set(toastId, timer);
           },
         }
       );
@@ -574,6 +637,15 @@ function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pool, watchKey, myPubkey]);
 
+  // Alle lopende auto-dismiss-timers opruimen bij unmount (App leeft de
+  // hele sessie, dus dit is puur voor de volledigheid).
+  useEffect(() => {
+    return () => {
+      toastTimersRef.current.forEach((timer) => clearTimeout(timer));
+      toastTimersRef.current.clear();
+    };
+  }, []);
+
   function clearChannel(id) {
     // Schuift de since-cursor van dit kanaal op naar nu: verlaat je het
     // straks weer, dan telt alleen wat er ná dit moment gebeurt nog mee —
@@ -585,9 +657,20 @@ function useChannelNotifications(pool, savedChannels, activeChannelId, myPubkey)
       delete next[id];
       return next;
     });
+    // Toasts van dit kanaal zijn achterhaald zodra je het opent.
+    setToasts((prev) => prev.filter((t) => t.channelId !== id));
   }
 
-  return { notifications, clearChannel };
+  function dismissToast(id) {
+    const timer = toastTimersRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  return { notifications, clearChannel, toasts, dismissToast };
 }
 
 /* ------------------------------------------------------------------ */
@@ -609,7 +692,7 @@ export default function App() {
   // maar de achtergrond-notificatie-subscriptie hieronder moet juist over
   // zo'n wissel heen blijven bestaan.
   const [savedChannels, setSavedChannels] = useState(loadSavedChannels);
-  const { notifications, clearChannel } = useChannelNotifications(
+  const { notifications, clearChannel, toasts, dismissToast } = useChannelNotifications(
     poolRef.current,
     savedChannels,
     channelId,
@@ -639,6 +722,10 @@ export default function App() {
 
   // key={channelId} laat de volledige dashboard (incl. alle Nostr/Yjs
   // abonnementen) schoon opnieuw opbouwen wanneer je van kanaal wisselt.
+  // toasts/dismissToast gaan mee tot in ChatPanel: die toont ze op precies
+  // dezelfde plek als het "Opgeslagen kanalen"-dropdownmenu (zie daar) —
+  // ze horen inhoudelijk bij elkaar, dus bewust geen apart, los zwevend
+  // toast-vlak elders in beeld.
   return (
     <Dashboard
       key={channelId}
@@ -647,6 +734,8 @@ export default function App() {
       savedChannels={savedChannels}
       setSavedChannels={setSavedChannels}
       notifications={notifications}
+      toasts={toasts}
+      dismissToast={dismissToast}
     />
   );
 }
@@ -655,7 +744,7 @@ export default function App() {
 /*  Dashboard: bevat het volledige split-screen                        */
 /* ------------------------------------------------------------------ */
 
-function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notifications }) {
+function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notifications, toasts, dismissToast }) {
   const identity = useNostrIdentity();
   const [displayName, setDisplayNameLocal] = useDisplayName();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1333,6 +1422,8 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         onRenameChannel={renameChannel}
         savedChannels={savedChannels}
         notifications={notifications}
+        toasts={toasts}
+        onDismissToast={dismissToast}
         menuOpen={menuOpen}
         onToggleMenu={() => setMenuOpen((v) => !v)}
         onCloseMenu={() => setMenuOpen(false)}
@@ -1460,6 +1551,8 @@ function ChatPanel({
   onRenameChannel,
   savedChannels,
   notifications,
+  toasts,
+  onDismissToast,
   menuOpen,
   onToggleMenu,
   onCloseMenu,
@@ -1607,6 +1700,60 @@ function ChatPanel({
                   </button>
                 );
               })}
+            </div>
+          )}
+
+          {/* Toast-popups voor activiteit in niet-actieve opgeslagen
+              kanalen — bewust op exact dezelfde plek en met dezelfde
+              opmaak als het "Opgeslagen kanalen"-menu hierboven (ze horen
+              inhoudelijk bij elkaar). Verborgen zolang dat menu open staat
+              om overlap te voorkomen; de badges daarin zijn dan toch al
+              zichtbaar. */}
+          {!menuOpen && toasts.length > 0 && (
+            <div className="absolute left-0 top-full mt-1 w-72 flex flex-col gap-2 z-20">
+              {toasts.map((t) => (
+                <div
+                  key={t.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    onSelectChannel(t.channelId);
+                    onDismissToast(t.id);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      onSelectChannel(t.channelId);
+                      onDismissToast(t.id);
+                    }
+                  }}
+                  className="bg-white border border-slate-200 rounded-lg shadow-lg cursor-pointer text-left px-3 py-2 hover:bg-slate-50 animate-[fadeIn_0.15s_ease-out]"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide truncate">
+                      {t.channelName}
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDismissToast(t.id);
+                      }}
+                      className="shrink-0 text-slate-300 hover:text-slate-500 text-xs leading-none"
+                      title="Sluiten"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="text-xs text-slate-700 mt-0.5">
+                    {t.authorName && !t.line.startsWith(t.authorName) ? (
+                      <>
+                        <span className="font-medium">{t.authorName}</span> {t.line}
+                      </>
+                    ) : (
+                      t.line
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>

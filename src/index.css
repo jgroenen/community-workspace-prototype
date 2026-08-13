@@ -33,3 +33,16 @@ body,
 .bn-editor {
   height: 100%;
 }
+
+/* Instap-animatie voor de notificatie-toasts (achtergrondactiviteit in
+   niet-actieve kanalen) — zie NotificationToasts in App.jsx. */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
