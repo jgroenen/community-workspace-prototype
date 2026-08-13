@@ -755,6 +755,12 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
   // video-oproepen bestaan — die open je bewust via een icoon of een link
   // in de chat. { type: 'doc' | 'call', id } of null (= bureaublad).
   const [activeItem, setActiveItem] = useState(null);
+  // Op smalle schermen (< Tailwind's md-breakpoint) is er geen ruimte voor
+  // chat én werkruimte naast elkaar — dan toont ChatPanel/WorkspacePanel er
+  // maar één tegelijk (fullscreen), omgeschakeld via de tabbalk onderin
+  // (zie MobileViewSwitcher). Op md+ genegeerd: daar staan beide altijd
+  // gewoon naast elkaar, zoals al het geval was.
+  const [mobileView, setMobileView] = useState('chat');
   // Een "gedockte" video-oproep: puur lokale UI-state (niet gesynchroniseerd
   // via Nostr — of jij een call minimaliseert is jouw eigen zaak), losgekoppeld
   // van activeItem zodat de Jitsi-iframe blijft draaien terwijl je ergens
@@ -1275,6 +1281,7 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     docsAtRef.current = Math.floor(Date.now() / 1000);
     setDocs(nextDocs);
     setActiveItem({ type: 'doc', id });
+    setMobileView('desktop'); // op mobiel meteen naar de werkruimte, anders zie je 'm niet
     publishEvent(DOCLIST_KIND, [['t', chatTag], ['d', docsDTag]], JSON.stringify(nextDocs));
     publishEvent(DOC_CREATED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, docId: id, docName: name }));
   }
@@ -1303,6 +1310,7 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     // dezelfde chatlink klikken): geen nieuw "geopend"-event, dat zou alleen
     // onnodig relay-verkeer (en rate-limit-risico) opleveren voor iets dat
     // al zichtbaar is.
+    setMobileView('desktop'); // op mobiel meteen naar de werkruimte, anders zie je 'm niet
     if (activeItem?.type === 'doc' && activeItem.id === docId) return;
     setActiveItem({ type: 'doc', id: docId });
     // Zelfherstellend: als dit document lokaal nog niet bekend is (bv. de
@@ -1418,9 +1426,16 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
 
   const currentChannel = savedChannels.find((c) => c.id === channelId);
   const channelName = currentChannel?.name ?? `Kanaal ${channelId.slice(0, 6)}`;
+  // Eén keer berekend hier (i.p.v. dubbel in ChatPanel én WorkspaceHeader):
+  // beide tonen op mobiel elk hun eigen kanalenmenu-knopje met dezelfde
+  // badge, zie SavedChannelsOverlay hieronder voor het gedeelde menu zelf.
+  const totalUnread = Object.values(notifications).reduce(
+    (sum, n) => sum + n.message + n.doc + n.call + n.presence,
+    0
+  );
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex bg-slate-100">
+    <div className="h-screen w-screen overflow-hidden flex flex-col md:flex-row bg-slate-100">
       <ChatPanel
         channelId={channelId}
         identity={identity}
@@ -1433,16 +1448,9 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         onRenameDisplayName={renameDisplayName}
         channelName={channelName}
         onRenameChannel={renameChannel}
-        savedChannels={savedChannels}
-        notifications={notifications}
-        toasts={toasts}
-        onDismissToast={dismissToast}
-        menuOpen={menuOpen}
         onToggleMenu={() => setMenuOpen((v) => !v)}
-        onCloseMenu={() => setMenuOpen(false)}
-        onSelectChannel={goToChannel}
-        onCreateChannel={createNewChannel}
-        onRemoveChannel={removeSavedChannel}
+        totalUnread={totalUnread}
+        mobileView={mobileView}
       />
       <WorkspacePanel
         channelId={channelId}
@@ -1463,7 +1471,11 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         onEndCall={endCall}
         identity={identity}
         displayName={displayName}
+        mobileView={mobileView}
+        onToggleMenu={() => setMenuOpen((v) => !v)}
+        totalUnread={totalUnread}
       />
+      <MobileViewSwitcher mobileView={mobileView} onChange={setMobileView} />
       <DockableVideoCall
         channelId={channelId}
         calls={calls}
@@ -1473,6 +1485,48 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         onUndock={undockCall}
         onEnd={endCall}
       />
+      <SavedChannelsOverlay
+        menuOpen={menuOpen}
+        onCloseMenu={() => setMenuOpen(false)}
+        savedChannels={savedChannels}
+        notifications={notifications}
+        channelId={channelId}
+        onSelectChannel={goToChannel}
+        onCreateChannel={createNewChannel}
+        onRemoveChannel={removeSavedChannel}
+        toasts={toasts}
+        onDismissToast={dismissToast}
+      />
+    </div>
+  );
+}
+
+// Tabbalk onderin, uitsluitend zichtbaar op smalle schermen (md:hidden) —
+// op zo'n scherm is er geen ruimte voor chat én werkruimte naast elkaar,
+// dus toont ChatPanel/WorkspacePanel er maar één tegelijk (fullscreen),
+// omgeschakeld door hierop te tikken. Op md+ altijd verborgen: daar staan
+// beide panelen toch al gewoon naast elkaar.
+function MobileViewSwitcher({ mobileView, onChange }) {
+  return (
+    <div className="md:hidden shrink-0 flex border-t border-slate-200 bg-white">
+      <button
+        onClick={() => onChange('chat')}
+        className={`flex-1 py-2 flex flex-col items-center gap-0.5 text-xs font-medium ${
+          mobileView === 'chat' ? 'text-indigo-600' : 'text-slate-400'
+        }`}
+      >
+        <span className="text-lg leading-none">💬</span>
+        Chat
+      </button>
+      <button
+        onClick={() => onChange('desktop')}
+        className={`flex-1 py-2 flex flex-col items-center gap-0.5 text-xs font-medium ${
+          mobileView === 'desktop' ? 'text-indigo-600' : 'text-slate-400'
+        }`}
+      >
+        <span className="text-lg leading-none">🖥️</span>
+        Werkruimte
+      </button>
     </div>
   );
 }
@@ -1501,7 +1555,7 @@ function DockableVideoCall({ channelId, calls, activeItem, dockedCall, displayNa
     <div
       className={
         isFullscreen
-          ? 'fixed top-14 right-0 w-1/2 h-[calc(100%-3.5rem)] z-30 bg-black'
+          ? 'fixed top-14 right-0 w-full md:w-1/2 h-[calc(100%-3.5rem)] z-30 bg-black'
           : 'fixed bottom-4 right-4 w-16 h-16 rounded-full overflow-hidden shadow-lg z-40'
       }
     >
@@ -1540,6 +1594,197 @@ function DockableVideoCall({ channelId, calls, activeItem, dockedCall, displayNa
   );
 }
 
+// Kanalenmenu + toast-popups + verwijder-bevestiging voor opgeslagen
+// kanalen — één keer gerenderd op Dashboard-niveau (niet genest in
+// ChatPanel), zodat het ook werkt als ChatPanel zelf op mobiel net
+// `hidden` is (je op de Werkruimte-tab zit). Zowel ChatPanel als
+// WorkspaceHeader hebben elk hun eigen hamburger-triggerknopje dat
+// dezelfde gedeelde `menuOpen`-state in Dashboard omschakelt — zie
+// data-savedchannels-trigger/-panel hieronder voor hoe buiten-klikken dat
+// correct sluit ongeacht welke knop 'm opende.
+function SavedChannelsOverlay({
+  menuOpen,
+  onCloseMenu,
+  savedChannels,
+  notifications,
+  channelId,
+  onSelectChannel,
+  onCreateChannel,
+  onRemoveChannel,
+  toasts,
+  onDismissToast,
+}) {
+  const [pendingDeleteChannel, setPendingDeleteChannel] = useState(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function handleClick(e) {
+      if (!e.target.closest('[data-savedchannels-trigger], [data-savedchannels-panel]')) onCloseMenu();
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [menuOpen, onCloseMenu]);
+
+  return (
+    <>
+      {menuOpen && (
+        // Op mobiel (< md) fullscreen met een expliciete sluitknop — een
+        // kleine, ergens-anders-op-tikken-om-te-sluiten dropdown werkt niet
+        // lekker op een smal scherm. Op md+ een klein anker-paneeltje
+        // linksboven (vaste positie i.p.v. relatief aan een specifieke
+        // knop, want er zijn er nu twee — zie hierboven).
+        <div
+          data-savedchannels-panel
+          className="fixed inset-0 z-30 flex flex-col bg-white md:inset-auto md:left-4 md:top-16 md:z-20 md:w-72 md:max-h-80 md:rounded-lg md:border md:border-slate-200 md:shadow-lg"
+        >
+          <div className="px-3 py-2 flex items-center justify-between border-b border-slate-100 shrink-0">
+            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">
+              Opgeslagen kanalen
+            </span>
+            <button
+              onClick={onCloseMenu}
+              className="text-slate-400 hover:text-slate-600 text-sm leading-none p-1 -m-1"
+              title="Sluiten"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="overflow-y-auto flex-1 md:flex-none">
+            {savedChannels.length === 0 && (
+              <div className="p-3 text-xs text-slate-400">Nog geen opgeslagen kanalen.</div>
+            )}
+            {savedChannels.map((c) => {
+              const n = notifications[c.id];
+              const unread = n ? n.message + n.doc + n.call + n.presence : 0;
+              const parts = [];
+              if (n?.message) parts.push(`${n.message} bericht${n.message > 1 ? 'en' : ''}`);
+              if (n?.doc) parts.push(`${n.doc} document${n.doc > 1 ? 'actie' : ''}`);
+              if (n?.call) parts.push(`${n.call} video-oproep${n.call > 1 ? 'en' : ''}`);
+              if (n?.presence) parts.push(`${n.presence}x iemand online gekomen`);
+              return (
+                <div
+                  key={c.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => onSelectChannel(c.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') onSelectChannel(c.id);
+                  }}
+                  className={`group w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 flex items-center justify-between gap-2 cursor-pointer ${
+                    c.id === channelId ? 'bg-indigo-50 font-medium' : ''
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate">{c.name}</div>
+                    <div className="truncate text-[10px] text-slate-400">{c.id}</div>
+                  </div>
+                  <div className="shrink-0 flex items-center gap-1.5">
+                    {unread > 0 && (
+                      <span
+                        className="inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold"
+                        title={parts.join(', ')}
+                      >
+                        {unread > 9 ? '9+' : unread}
+                      </span>
+                    )}
+                    {/* Puur een lokale bladwijzer verwijderen — de chat/
+                        documenten van het kanaal zelf blijven gewoon
+                        bestaan. Bezoek je het later opnieuw via een link,
+                        dan verschijnt het vanzelf weer in dit lijstje.
+                        Altijd zichtbaar op mobiel (geen hover op touch),
+                        pas bij hover op md+. */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPendingDeleteChannel({ id: c.id, name: c.name });
+                      }}
+                      className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-slate-300 hover:text-red-500 leading-none transition-opacity"
+                      title={`"${c.name}" uit opgeslagen kanalen verwijderen`}
+                    >
+                      🗑️
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            <button
+              onClick={onCreateChannel}
+              className="w-full text-left px-3 py-2 text-xs text-indigo-600 hover:bg-indigo-50 flex items-center gap-1.5 border-t border-slate-100"
+            >
+              <span className="text-sm leading-none">＋</span>
+              Nieuw kanaal aanmaken
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Toast-popups voor activiteit in niet-actieve opgeslagen kanalen —
+          bewust dezelfde visuele taal als het menu hierboven. Verborgen
+          zolang dat menu open staat om overlap te voorkomen; de badges
+          daarin zijn dan toch al zichtbaar. */}
+      {!menuOpen && toasts.length > 0 && (
+        <div className="fixed left-4 top-16 w-72 max-w-[calc(100vw-2rem)] flex flex-col gap-2 z-20">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                onSelectChannel(t.channelId);
+                onDismissToast(t.id);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  onSelectChannel(t.channelId);
+                  onDismissToast(t.id);
+                }
+              }}
+              className="bg-white border border-slate-200 rounded-lg shadow-lg cursor-pointer text-left px-3 py-2 hover:bg-slate-50 animate-[fadeIn_0.15s_ease-out]"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide truncate">
+                  {t.channelName}
+                </div>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDismissToast(t.id);
+                  }}
+                  className="shrink-0 text-slate-300 hover:text-slate-500 text-xs leading-none"
+                  title="Sluiten"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="text-xs text-slate-700 mt-0.5">
+                {t.authorName && !t.line.startsWith(t.authorName) ? (
+                  <>
+                    <span className="font-medium">{t.authorName}</span> {t.line}
+                  </>
+                ) : (
+                  t.line
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {pendingDeleteChannel && (
+        <ConfirmDeleteModal
+          label={pendingDeleteChannel.name}
+          kind="channel"
+          onConfirm={() => {
+            onRemoveChannel(pendingDeleteChannel.id);
+            setPendingDeleteChannel(null);
+          }}
+          onCancel={() => setPendingDeleteChannel(null)}
+        />
+      )}
+    </>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Linkerpaneel: Nostr-chat                                            */
 /* ------------------------------------------------------------------ */
@@ -1563,41 +1808,19 @@ function ChatPanel({
   onRenameDisplayName,
   channelName,
   onRenameChannel,
-  savedChannels,
-  notifications,
-  toasts,
-  onDismissToast,
-  menuOpen,
   onToggleMenu,
-  onCloseMenu,
-  onSelectChannel,
-  onCreateChannel,
-  onRemoveChannel,
+  totalUnread,
+  mobileView,
 }) {
   const [input, setInput] = useState('');
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(channelName);
   const [editingDisplayName, setEditingDisplayName] = useState(false);
   const [displayNameDraft, setDisplayNameDraft] = useState(displayName);
-  // { id, name } van het opgeslagen kanaal waarvoor net op het prullenbakje
-  // is geklikt, of null als er niets ter bevestiging staat — zelfde
-  // bevestig-modal-patroon als bij document/video-oproep verwijderen.
-  const [pendingDeleteChannel, setPendingDeleteChannel] = useState(null);
   const bottomRef = useRef(null);
-  const menuRef = useRef(null);
 
   useEffect(() => setNameDraft(channelName), [channelName]);
   useEffect(() => setDisplayNameDraft(displayName), [displayName]);
-
-  // Sluit het werkruimte-dropdown-menu bij een klik erbuiten.
-  useEffect(() => {
-    if (!menuOpen) return;
-    function handleClick(e) {
-      if (menuRef.current && !menuRef.current.contains(e.target)) onCloseMenu();
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, onCloseMenu]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
@@ -1630,41 +1853,44 @@ function ChatPanel({
     else setDisplayNameDraft(displayName);
   }
 
-  const totalUnread = Object.values(notifications).reduce(
-    (sum, n) => sum + n.message + n.doc + n.call + n.presence,
-    0
-  );
-
   return (
-    <>
-    <div className="w-1/2 h-full flex flex-col bg-white border-r border-slate-200">
-      {/* Kanaalheader */}
-      <div className="h-14 flex items-center justify-between gap-2 px-4 border-b border-slate-200 shrink-0">
-        <div className="flex items-center gap-2 min-w-0 relative" ref={menuRef}>
-          {/* Zelfgebouwd i.p.v. het '☰'-teken: emoji-iconen (🖥️/📄/📹 in
-              WorkspaceHeader hiernaast) en tekst-glyphs zoals ☰ hebben een
-              net andere positionering binnen hun tekenbox, wat bij dezelfde
-              text-lg/leading-none-opmaak toch een merkbaar scheve uitlijning
-              gaf. Deze vaste 18×18px-doos lijnt wél exact uit met het
-              Bureaublad-icoon ernaast. */}
-          <button
-            onClick={onToggleMenu}
-            className="relative flex items-center justify-center shrink-0 w-[18px] h-[18px] rounded hover:bg-slate-100"
-            title={
-              totalUnread > 0
-                ? `Opgeslagen werkruimtes (${totalUnread} nieuw in andere kanalen)`
-                : 'Opgeslagen werkruimtes'
-            }
-          >
-            <span className="flex flex-col items-center justify-center gap-[3px]">
-              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
-              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
-              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
-            </span>
-            {totalUnread > 0 && (
-              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500" />
-            )}
-          </button>
+    <div
+      className={`${mobileView === 'chat' ? 'flex' : 'hidden'} md:flex flex-col flex-1 min-h-0 w-full md:w-1/2 md:flex-none md:h-full bg-white border-r border-slate-200`}
+    >
+      {/* Kanaalheader — 3 zones (hamburger / titel / balancerende spacer)
+          zodat de titel op mobiel exact gecentreerd staat; op md+ schuift
+          de titel gewoon weer naar links (justify-start), zoals voorheen. */}
+      <div className="h-14 flex items-center gap-2 px-4 border-b border-slate-200 shrink-0">
+        {/* Zelfgebouwd i.p.v. het '☰'-teken: emoji-iconen (🖥️/📄/📹 in
+            WorkspaceHeader hiernaast) en tekst-glyphs zoals ☰ hebben een net
+            andere positionering binnen hun tekenbox, wat bij dezelfde
+            text-lg/leading-none-opmaak toch een merkbaar scheve uitlijning
+            gaf. Deze vaste 18×18px-doos lijnt wél exact uit met het
+            Bureaublad-icoon ernaast. Zelfde knop (met data-attribuut voor
+            buiten-klik-detectie) staat ook, mobiel-only, in WorkspaceHeader
+            — zie SavedChannelsOverlay voor het gedeelde menu dat beide
+            knoppen openen. */}
+        <button
+          data-savedchannels-trigger
+          onClick={onToggleMenu}
+          className="relative flex items-center justify-center shrink-0 w-[18px] h-[18px] rounded hover:bg-slate-100"
+          title={
+            totalUnread > 0
+              ? `Opgeslagen werkruimtes (${totalUnread} nieuw in andere kanalen)`
+              : 'Opgeslagen werkruimtes'
+          }
+        >
+          <span className="flex flex-col items-center justify-center gap-[3px]">
+            <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+            <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+            <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+          </span>
+          {totalUnread > 0 && (
+            <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500" />
+          )}
+        </button>
+        <div className="flex-1 min-w-0 flex items-center justify-center md:justify-start gap-1.5">
+          <span className="text-base leading-none shrink-0">💬</span>
           {editingName ? (
             <input
               autoFocus
@@ -1683,137 +1909,16 @@ function ChatPanel({
           ) : (
             <button
               onClick={() => setEditingName(true)}
-              className="text-sm font-semibold truncate hover:underline text-left"
+              className="text-sm font-semibold truncate hover:underline text-center md:text-left"
               title="Klik om dit kanaal een eigen naam te geven"
             >
               {channelName}
             </button>
           )}
-
-          {menuOpen && (
-            <div className="absolute left-0 top-full mt-1 w-72 max-h-80 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg z-20">
-              <div className="px-3 py-2 text-[11px] font-semibold text-slate-400 uppercase tracking-wide border-b border-slate-100">
-                Opgeslagen kanalen
-              </div>
-              {savedChannels.length === 0 && (
-                <div className="p-3 text-xs text-slate-400">Nog geen opgeslagen kanalen.</div>
-              )}
-              {savedChannels.map((c) => {
-                const n = notifications[c.id];
-                const unread = n ? n.message + n.doc + n.call + n.presence : 0;
-                const parts = [];
-                if (n?.message) parts.push(`${n.message} bericht${n.message > 1 ? 'en' : ''}`);
-                if (n?.doc) parts.push(`${n.doc} document${n.doc > 1 ? 'actie' : ''}`);
-                if (n?.call) parts.push(`${n.call} video-oproep${n.call > 1 ? 'en' : ''}`);
-                if (n?.presence) parts.push(`${n.presence}x iemand online gekomen`);
-                return (
-                  <div
-                    key={c.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => onSelectChannel(c.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') onSelectChannel(c.id);
-                    }}
-                    className={`group w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 flex items-center justify-between gap-2 cursor-pointer ${
-                      c.id === channelId ? 'bg-indigo-50 font-medium' : ''
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate">{c.name}</div>
-                      <div className="truncate text-[10px] text-slate-400">{c.id}</div>
-                    </div>
-                    <div className="shrink-0 flex items-center gap-1.5">
-                      {unread > 0 && (
-                        <span
-                          className="inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold"
-                          title={parts.join(', ')}
-                        >
-                          {unread > 9 ? '9+' : unread}
-                        </span>
-                      )}
-                      {/* Puur een lokale bladwijzer verwijderen — de chat/
-                          documenten van het kanaal zelf blijven gewoon
-                          bestaan. Bezoek je het later opnieuw via een link,
-                          dan verschijnt het vanzelf weer in dit lijstje. */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setPendingDeleteChannel({ id: c.id, name: c.name });
-                        }}
-                        className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-red-500 leading-none transition-opacity"
-                        title={`"${c.name}" uit opgeslagen kanalen verwijderen`}
-                      >
-                        🗑️
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-              <button
-                onClick={onCreateChannel}
-                className="w-full text-left px-3 py-2 text-xs text-indigo-600 hover:bg-indigo-50 flex items-center gap-1.5 border-t border-slate-100"
-              >
-                <span className="text-sm leading-none">＋</span>
-                Nieuw kanaal aanmaken
-              </button>
-            </div>
-          )}
-
-          {/* Toast-popups voor activiteit in niet-actieve opgeslagen
-              kanalen — bewust op exact dezelfde plek en met dezelfde
-              opmaak als het "Opgeslagen kanalen"-menu hierboven (ze horen
-              inhoudelijk bij elkaar). Verborgen zolang dat menu open staat
-              om overlap te voorkomen; de badges daarin zijn dan toch al
-              zichtbaar. */}
-          {!menuOpen && toasts.length > 0 && (
-            <div className="absolute left-0 top-full mt-1 w-72 flex flex-col gap-2 z-20">
-              {toasts.map((t) => (
-                <div
-                  key={t.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => {
-                    onSelectChannel(t.channelId);
-                    onDismissToast(t.id);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      onSelectChannel(t.channelId);
-                      onDismissToast(t.id);
-                    }
-                  }}
-                  className="bg-white border border-slate-200 rounded-lg shadow-lg cursor-pointer text-left px-3 py-2 hover:bg-slate-50 animate-[fadeIn_0.15s_ease-out]"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide truncate">
-                      {t.channelName}
-                    </div>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDismissToast(t.id);
-                      }}
-                      className="shrink-0 text-slate-300 hover:text-slate-500 text-xs leading-none"
-                      title="Sluiten"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <div className="text-xs text-slate-700 mt-0.5">
-                    {t.authorName && !t.line.startsWith(t.authorName) ? (
-                      <>
-                        <span className="font-medium">{t.authorName}</span> {t.line}
-                      </>
-                    ) : (
-                      t.line
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
+        {/* Balanceert de hamburger-knop links, puur voor centrering op
+            mobiel — geen functie, niet interactief. */}
+        <div className="w-[18px] shrink-0" aria-hidden="true" />
       </div>
 
       {/* Berichtenlog */}
@@ -1942,18 +2047,6 @@ function ChatPanel({
         </button>
       </div>
     </div>
-    {pendingDeleteChannel && (
-      <ConfirmDeleteModal
-        label={pendingDeleteChannel.name}
-        kind="channel"
-        onConfirm={() => {
-          onRemoveChannel(pendingDeleteChannel.id);
-          setPendingDeleteChannel(null);
-        }}
-        onCancel={() => setPendingDeleteChannel(null)}
-      />
-    )}
-    </>
   );
 }
 
@@ -2006,6 +2099,9 @@ function WorkspacePanel({
   onEndCall,
   identity,
   displayName,
+  mobileView,
+  onToggleMenu,
+  totalUnread,
 }) {
   const activeDoc = activeItem?.type === 'doc' ? docs.find((d) => d.id === activeItem.id) : null;
   const activeCall = activeItem?.type === 'call' ? calls.find((c) => c.id === activeItem.id) : null;
@@ -2013,7 +2109,9 @@ function WorkspacePanel({
   const onDesktop = !activeDoc && !activeCall;
 
   return (
-    <div className="w-1/2 h-full flex flex-col bg-white">
+    <div
+      className={`${mobileView === 'desktop' ? 'flex' : 'hidden'} md:flex flex-col flex-1 min-h-0 w-full md:w-1/2 md:flex-none md:h-full bg-white`}
+    >
       <WorkspaceHeader
         onDesktop={onDesktop}
         icon={onDesktop ? '🖥️' : activeDoc ? '📄' : '📹'}
@@ -2028,6 +2126,8 @@ function WorkspacePanel({
         }
         onDock={activeCall ? onDockCall : undefined}
         onClose={activeCall ? onEndCall : onGoToDesktop}
+        onToggleMenu={onToggleMenu}
+        totalUnread={totalUnread}
       />
 
       <div className="flex-1 min-h-0 relative">
@@ -2070,7 +2170,7 @@ function WorkspacePanel({
 // zodra een document open staat, of de video-oproepnaam tijdens een call.
 // Een document/call heeft een ✕ rechtsboven om terug te gaan naar het
 // bureaublad.
-function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, onClose }) {
+function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, onClose, onToggleMenu, totalUnread }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(title ?? '');
 
@@ -2090,9 +2190,31 @@ function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, o
   }
 
   return (
-    <div className="h-14 flex items-center justify-between gap-2 px-4 border-b border-slate-200 shrink-0">
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="text-lg leading-none">{icon}</span>
+    <div className="h-14 flex items-center gap-2 px-4 border-b border-slate-200 shrink-0">
+      {/* Mobiel-only: dezelfde kanalenmenu-knop als in ChatPanel (zie
+          uitleg daar). Op md+ verborgen — daar volstaat de ene knop in
+          ChatPanel, want beide panelen staan toch al naast elkaar. Op
+          desktop dus geen linkerzone hier, en blijft de titel via
+          md:justify-start gewoon links staan. */}
+      <button
+        data-savedchannels-trigger
+        onClick={onToggleMenu}
+        className="relative md:hidden flex items-center justify-center shrink-0 w-[18px] h-[18px] rounded hover:bg-slate-100"
+        title={
+          totalUnread > 0
+            ? `Opgeslagen werkruimtes (${totalUnread} nieuw in andere kanalen)`
+            : 'Opgeslagen werkruimtes'
+        }
+      >
+        <span className="flex flex-col items-center justify-center gap-[3px]">
+          <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+          <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+          <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+        </span>
+        {totalUnread > 0 && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500" />}
+      </button>
+      <div className="flex-1 min-w-0 flex items-center justify-center md:justify-start gap-2">
+        <span className="text-lg leading-none shrink-0">{icon}</span>
         {!editable ? (
           <span className="text-sm font-semibold text-slate-700 truncate" title={title}>
             {title}
@@ -2115,14 +2237,14 @@ function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, o
         ) : (
           <button
             onClick={() => setEditing(true)}
-            className="text-sm font-semibold truncate hover:underline text-left"
+            className="text-sm font-semibold truncate hover:underline text-center md:text-left"
             title={`${title} — klik om te hernoemen`}
           >
             {title}
           </button>
         )}
       </div>
-      {!onDesktop && (
+      {!onDesktop ? (
         <div className="flex items-center gap-1 shrink-0">
           {onDock && (
             <button
@@ -2141,6 +2263,11 @@ function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, o
             ✕
           </button>
         </div>
+      ) : (
+        // Balanceert de mobiele hamburger-knop links, puur voor centrering
+        // — op md+ neemt de (dan md:hidden) hamburger toch al geen ruimte
+        // in, dus is deze spacer daar ook niet nodig.
+        <div className="w-[18px] shrink-0 md:hidden" aria-hidden="true" />
       )}
     </div>
   );

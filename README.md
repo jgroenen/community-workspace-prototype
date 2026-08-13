@@ -132,6 +132,19 @@ identity-sleutel van elke peer.
   pubkey), en elk kanaal heeft een eigen since-cursor (pas actief vanaf het
   moment dat je het verlaat) — anders zou je bij het wisselen van kanaal
   steeds je eigen recente presence-join opnieuw als melding terugkrijgen.
+- **Mobiele weergave**: op smalle schermen (< Tailwind's `md`-breakpoint,
+  768px) is er geen ruimte voor chat én werkruimte naast elkaar. Dashboard
+  toont dan nog maar één paneel tegelijk (fullscreen), omgeschakeld via een
+  tabbalk onderin ("💬 Chat" / "🖥️ Werkruimte") — zie `mobileView`-state en
+  `MobileViewSwitcher` in App.jsx. Een document/video-oproep openen of
+  aanmaken schakelt automatisch naar de werkruimte, zodat je meteen ziet
+  wat je net deed. Het kanalenmenu (hamburger-icoon) en de
+  achtergrond-notificaties zijn op mobiel vanaf **beide** panelen
+  bereikbaar (elk met hun eigen knopje, dezelfde gedeelde `menuOpen`-state
+  — zie `SavedChannelsOverlay`) en het menu zelf wordt op mobiel fullscreen
+  in plaats van een kleine dropdown, met een expliciete sluitknop. Op
+  desktop (md+) blijft alles zoals het was: beide panelen permanent naast
+  elkaar, één hamburger-knop, klein anker-dropdown-menu.
 - **Nostr-chat**: berichten zijn `kind 1`-events getagd met
   `t = wschat-<kanaal-id>`, gepubliceerd/opgehaald via `nostr-tools`
   (`SimplePool`) op `relay.damus.io`, `nos.lol` en `relay.nostr.band`. Zonder
