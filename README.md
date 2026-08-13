@@ -110,8 +110,12 @@ identity-sleutel van elke peer.
 - **Opgeslagen werkruimtes**: elk bezocht kanaal wordt met een naam in
   `localStorage` bewaard. Klik op de kanaalnaam linksboven om 'm te
   hernoemen (publiceert een kind-30079-event, zichtbaar voor iedereen in het
-  kanaal); klik op "📂 Werkruimtes" om terug te springen naar een eerder
-  kanaal.
+  kanaal); klik op het hamburger-icoon (☰) linksboven om naar een eerder
+  kanaal te springen, een nieuw kanaal aan te maken (onderaan het lijstje),
+  of een kanaal via het prullenbakje (met bevestiging, net als bij een
+  document/video-oproep) uit dit lokale lijstje te verwijderen — dat is
+  puur een bladwijzer weghalen, het kanaal zelf blijft gewoon bestaan en
+  verschijnt vanzelf weer zodra je de link opnieuw bezoekt.
 - **Achtergrond-notificaties voor andere kanalen**: naast het kanaal dat je
   nu open hebt, houdt `useChannelNotifications` (App.jsx) voor élk opgeslagen
   kanaal een lichte achtergrond-subscriptie bij — alleen de metadata-kinds

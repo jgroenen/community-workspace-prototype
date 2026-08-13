@@ -1245,11 +1245,24 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
 
   function createNewChannel() {
     window.location.hash = generateChannelId();
+    setMenuOpen(false);
   }
 
   function goToChannel(id) {
     window.location.hash = id;
     setMenuOpen(false);
+  }
+
+  // Puur lokaal (localStorage) — haalt een kanaal uit je eigen bladwijzer-
+  // lijst, verandert niets aan het kanaal zelf of voor andere deelnemers.
+  // Bezoek je het later via een link/URL opnieuw, dan verschijnt het
+  // vanzelf weer (zie het 'kanaal bezocht'-effect hierboven).
+  function removeSavedChannel(id) {
+    setSavedChannels((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      persistSavedChannels(next);
+      return next;
+    });
   }
 
   // Net als bij een nieuw kanaal: geen naam-prompt, gewoon een korte
@@ -1429,6 +1442,7 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         onCloseMenu={() => setMenuOpen(false)}
         onSelectChannel={goToChannel}
         onCreateChannel={createNewChannel}
+        onRemoveChannel={removeSavedChannel}
       />
       <WorkspacePanel
         channelId={channelId}
@@ -1558,12 +1572,17 @@ function ChatPanel({
   onCloseMenu,
   onSelectChannel,
   onCreateChannel,
+  onRemoveChannel,
 }) {
   const [input, setInput] = useState('');
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(channelName);
   const [editingDisplayName, setEditingDisplayName] = useState(false);
   const [displayNameDraft, setDisplayNameDraft] = useState(displayName);
+  // { id, name } van het opgeslagen kanaal waarvoor net op het prullenbakje
+  // is geklikt, of null als er niets ter bevestiging staat — zelfde
+  // bevestig-modal-patroon als bij document/video-oproep verwijderen.
+  const [pendingDeleteChannel, setPendingDeleteChannel] = useState(null);
   const bottomRef = useRef(null);
   const menuRef = useRef(null);
 
@@ -1617,21 +1636,31 @@ function ChatPanel({
   );
 
   return (
+    <>
     <div className="w-1/2 h-full flex flex-col bg-white border-r border-slate-200">
       {/* Kanaalheader */}
       <div className="h-14 flex items-center justify-between gap-2 px-4 border-b border-slate-200 shrink-0">
-        <div className="flex items-center gap-1 min-w-0 relative" ref={menuRef}>
+        <div className="flex items-center gap-2 min-w-0 relative" ref={menuRef}>
+          {/* Zelfgebouwd i.p.v. het '☰'-teken: emoji-iconen (🖥️/📄/📹 in
+              WorkspaceHeader hiernaast) en tekst-glyphs zoals ☰ hebben een
+              net andere positionering binnen hun tekenbox, wat bij dezelfde
+              text-lg/leading-none-opmaak toch een merkbaar scheve uitlijning
+              gaf. Deze vaste 18×18px-doos lijnt wél exact uit met het
+              Bureaublad-icoon ernaast. */}
           <button
             onClick={onToggleMenu}
-            className="relative flex items-center gap-0.5 shrink-0 rounded hover:bg-slate-100 p-1 -m-1"
+            className="relative flex items-center justify-center shrink-0 w-[18px] h-[18px] rounded hover:bg-slate-100"
             title={
               totalUnread > 0
                 ? `Opgeslagen werkruimtes (${totalUnread} nieuw in andere kanalen)`
                 : 'Opgeslagen werkruimtes'
             }
           >
-            <span className="text-lg leading-none">💬</span>
-            <span className="text-[10px] text-slate-400 leading-none">▾</span>
+            <span className="flex flex-col items-center justify-center gap-[3px]">
+              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+              <span className="block w-[14px] h-[2px] rounded-full bg-slate-700" />
+            </span>
             {totalUnread > 0 && (
               <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500" />
             )}
@@ -1678,10 +1707,15 @@ function ChatPanel({
                 if (n?.call) parts.push(`${n.call} video-oproep${n.call > 1 ? 'en' : ''}`);
                 if (n?.presence) parts.push(`${n.presence}x iemand online gekomen`);
                 return (
-                  <button
+                  <div
                     key={c.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => onSelectChannel(c.id)}
-                    className={`w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 flex items-center justify-between gap-2 ${
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') onSelectChannel(c.id);
+                    }}
+                    className={`group w-full text-left px-3 py-2 text-xs hover:bg-slate-50 border-b border-slate-100 last:border-0 flex items-center justify-between gap-2 cursor-pointer ${
                       c.id === channelId ? 'bg-indigo-50 font-medium' : ''
                     }`}
                   >
@@ -1689,17 +1723,40 @@ function ChatPanel({
                       <div className="truncate">{c.name}</div>
                       <div className="truncate text-[10px] text-slate-400">{c.id}</div>
                     </div>
-                    {unread > 0 && (
-                      <span
-                        className="shrink-0 inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold"
-                        title={parts.join(', ')}
+                    <div className="shrink-0 flex items-center gap-1.5">
+                      {unread > 0 && (
+                        <span
+                          className="inline-flex items-center justify-center min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold"
+                          title={parts.join(', ')}
+                        >
+                          {unread > 9 ? '9+' : unread}
+                        </span>
+                      )}
+                      {/* Puur een lokale bladwijzer verwijderen — de chat/
+                          documenten van het kanaal zelf blijven gewoon
+                          bestaan. Bezoek je het later opnieuw via een link,
+                          dan verschijnt het vanzelf weer in dit lijstje. */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPendingDeleteChannel({ id: c.id, name: c.name });
+                        }}
+                        className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-red-500 leading-none transition-opacity"
+                        title={`"${c.name}" uit opgeslagen kanalen verwijderen`}
                       >
-                        {unread > 9 ? '9+' : unread}
-                      </span>
-                    )}
-                  </button>
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
                 );
               })}
+              <button
+                onClick={onCreateChannel}
+                className="w-full text-left px-3 py-2 text-xs text-indigo-600 hover:bg-indigo-50 flex items-center gap-1.5 border-t border-slate-100"
+              >
+                <span className="text-sm leading-none">＋</span>
+                Nieuw kanaal aanmaken
+              </button>
             </div>
           )}
 
@@ -1757,14 +1814,6 @@ function ChatPanel({
             </div>
           )}
         </div>
-
-        <button
-          onClick={onCreateChannel}
-          className="text-xs px-2 py-1 rounded bg-indigo-50 text-indigo-600 hover:bg-indigo-100 whitespace-nowrap shrink-0"
-          title="Nieuw kanaal aanmaken"
-        >
-          ＋ Nieuw
-        </button>
       </div>
 
       {/* Berichtenlog */}
@@ -1893,6 +1942,18 @@ function ChatPanel({
         </button>
       </div>
     </div>
+    {pendingDeleteChannel && (
+      <ConfirmDeleteModal
+        label={pendingDeleteChannel.name}
+        kind="channel"
+        onConfirm={() => {
+          onRemoveChannel(pendingDeleteChannel.id);
+          setPendingDeleteChannel(null);
+        }}
+        onCancel={() => setPendingDeleteChannel(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -2158,7 +2219,7 @@ function WorkspaceDesktop({ docs, calls, onOpenDoc, onOpenCall, onCreateDoc, onC
       {pendingDelete && (
         <ConfirmDeleteModal
           label={pendingDelete.name}
-          isCall={pendingDelete.type === 'call'}
+          kind={pendingDelete.type}
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
         />
@@ -2211,15 +2272,28 @@ function DesktopIcon({ icon, label, onOpen, onRequestDelete }) {
   );
 }
 
-function ConfirmDeleteModal({ label, isCall, onConfirm, onCancel }) {
+// kind: 'doc' | 'call' | 'channel' — bepaalt zowel het zelfstandig
+// naamwoord in de vraag als (voor 'channel') een geruststellende
+// toelichting: het verwijderen van een opgeslagen kanaal is puur een
+// lokale bladwijzer die verdwijnt, geen destructieve actie op het kanaal
+// zelf (in tegenstelling tot een document/video-oproep verwijderen, wat
+// wél een Nostr-event naar alle deelnemers stuurt).
+function ConfirmDeleteModal({ label, kind = 'doc', onConfirm, onCancel }) {
+  const noun = kind === 'call' ? 'de video-oproep' : kind === 'channel' ? 'het kanaal' : 'het document';
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onCancel}>
       <div className="bg-white rounded-lg shadow-xl p-5 w-80 max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
-        <p className="text-sm text-slate-700 mb-4">
-          Weet je zeker dat je {isCall ? 'de video-oproep' : 'het document'}{' '}
-          <span className="font-medium">"{label}"</span> wilt verwijderen?
+        <p className="text-sm text-slate-700 mb-1">
+          Weet je zeker dat je {noun} <span className="font-medium">"{label}"</span>{' '}
+          {kind === 'channel' ? 'uit je opgeslagen kanalen wilt verwijderen' : 'wilt verwijderen'}?
         </p>
-        <div className="flex justify-end gap-2">
+        {kind === 'channel' && (
+          <p className="text-xs text-slate-400 mb-3">
+            Het kanaal zelf (chat, documenten, video-oproepen) blijft gewoon bestaan — dit haalt 'm alleen uit dit
+            lijstje. Bezoek je de link later opnieuw, dan verschijnt hij vanzelf weer.
+          </p>
+        )}
+        <div className={`flex justify-end gap-2 ${kind === 'channel' ? '' : 'mt-3'}`}>
           <button onClick={onCancel} className="text-xs px-3 py-1.5 rounded border border-slate-200 hover:bg-slate-50">
             Annuleren
           </button>
