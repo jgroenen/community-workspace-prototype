@@ -424,9 +424,70 @@ function useDocumentSync(pool, identity, channelId, docs) {
   return instancesRef.current;
 }
 
+// .archive.jsonl — precies één, altijd-aanwezig document per kanaal: een
+// doorlopend, alleen-lezen logboek van alle betekenisvolle events (zie
+// describeArchiveEntry). Bewust géén gewoon document: geen aanmaak-actie,
+// geen vermelding in de documentenlijst (DOCLIST_KIND) of chat-pill —
+// het bestaat impliciet zodra het kanaal bestaat, met een vast, uit
+// channelId/channelTag afgeleid ID, zodat elke deelnemer onafhankelijk
+// dezelfde room construeert. Draait verder in exact dezelfde
+// achtergrond-syncset (IndexedDB + WebRTC) als een gewoon document.
+const ARCHIVE_ROOM_ID = 'archive';
+
+function useArchiveDoc(pool, identity, channelId, channelTag) {
+  const instanceRef = useRef(null); // { ydoc, idbPersistence, provider, entries }
+  const [entries, setEntries] = useState(null); // Y.Map<eventId, jsonLine> zodra klaar
+
+  useEffect(() => {
+    if (!pool || !identity || !channelTag) return;
+    // Lokale IndexedDB-naam: blijft het rauwe channelId (nooit over het
+    // netwerk). Publieke Nostr-'t'-tag voor de WebRTC-signaling: het
+    // pseudoniem, net als bij gewone documenten (zie useDocumentSync).
+    const localName = `wsdoc-${channelId}-${ARCHIVE_ROOM_ID}`;
+    const roomTag = `wsdoc-${channelTag}-${ARCHIVE_ROOM_ID}`;
+    const ydoc = new Y.Doc();
+    const idbPersistence = new IndexeddbPersistence(localName, ydoc);
+    const provider = new NostrWebrtcProvider(roomTag, ydoc, { pool, relays: RELAYS, identity });
+    // Bewust een Y.Map, geen Y.Array: élke online deelnemer verwerkt
+    // hetzelfde binnenkomende event onafhankelijk (ieders eigen onevent-
+    // handler roept recordEvent aan) — met een Array zou dat per event
+    // evenveel dubbele regels opleveren als er op dat moment peers online
+    // zijn. Een Map geeft, met event.id als key, gratis idempotentie: dezelfde
+    // key nogmaals zetten is een no-op voor de samengevoegde eindstand.
+    // Chronologische volgorde komt niet uit de map zelf (key-volgorde ≠
+    // tijdsvolgorde), maar uit het ISO-tijdstip vooraan elke opgeslagen
+    // JSON-regel — zie ArchiveViewer, dat er simpelweg op sorteert.
+    const yEntries = ydoc.getMap('entries');
+    instanceRef.current = { ydoc, idbPersistence, provider, entries: yEntries };
+    setEntries(yEntries);
+
+    return () => {
+      provider.destroy();
+      idbPersistence.destroy();
+      ydoc.destroy();
+      instanceRef.current = null;
+    };
+  }, [pool, identity, channelId, channelTag]);
+
+  function recordEvent(id, line) {
+    const map = instanceRef.current?.entries;
+    if (map && !map.has(id)) map.set(id, line);
+  }
+
+  return { entries, recordEvent };
+}
+
 /* ------------------------------------------------------------------ */
 /*  URL-hash routing                                                    */
 /* ------------------------------------------------------------------ */
+
+// Kanaal-ID's die in déze sessie zelf zijn gegenereerd (nooit ergens
+// anders vandaan gekomen) — module-scope, geen React-state nodig, puur om
+// Dashboard te kunnen laten weten "dit kanaal ontstaat hier zojuist" en
+// dus de allereerste .archive.jsonl-regel te schrijven ("Kanaal
+// aangemaakt — URL: ..."). Zie useChannelId hieronder en createNewChannel
+// in Dashboard.
+const freshlyCreatedChannelIds = new Set();
 
 function useChannelId() {
   const [channelId, setChannelId] = useState(null);
@@ -437,7 +498,9 @@ function useChannelId() {
       if (!hash) {
         // Geen kanaal in de URL: genereer er één en herschrijf de hash.
         // Dit triggert een 'hashchange'-event dat resolve() opnieuw aanroept.
-        window.location.hash = generateChannelId();
+        const id = generateChannelId();
+        freshlyCreatedChannelIds.add(id);
+        window.location.hash = id;
       } else {
         setChannelId(hash);
       }
@@ -499,6 +562,59 @@ function describeNotificationEvent(kind, decrypted) {
   if (kind === CALL_STARTED_KIND) return { authorName, line: `heeft video-oproep "${parsed.callName}" gestart` };
   if (kind === CALL_OPENED_KIND) return { authorName, line: `heeft video-oproep "${parsed.callName}" geopend` };
   return null;
+}
+
+// Zet een gedecodeerd event om naar één complete, leesbare regel voor het
+// .archive.jsonl-logboek (zie useArchiveDoc) — dekt bewust een breder scala
+// aan kinds dan describeNotificationEvent hierboven (ook hernoemen/
+// verwijderen/kanaalnaam), want het archief hoort een zo compleet
+// mogelijke geschiedenis te zijn. Bewust dezelfde formulering als de
+// permanente pills/systeemberichten in de chat-tijdlijn zelf. Geeft `null`
+// terug voor kinds die geen eigen verhalende regel verdienen (pure
+// lijst-state-sync zoals DOCLIST_KIND/CALLLIST_KIND, of onbekende kinds).
+function describeArchiveEntry(kind, decrypted, event) {
+  if (kind === CHAT_KIND) {
+    let author;
+    try {
+      author = `${nip19.npubEncode(event.pubkey).slice(0, 12)}…`;
+    } catch {
+      author = event.pubkey.slice(0, 8);
+    }
+    return `${author}: ${decrypted}`;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(decrypted);
+  } catch {
+    return null;
+  }
+  const name = parsed.name ?? 'Iemand';
+  switch (kind) {
+    case PRESENCE_JOIN_KIND:
+      return `${name} is de chat binnengekomen`;
+    case PRESENCE_RENAME_KIND:
+      return `${parsed.oldname ?? 'Iemand'} heet nu ${parsed.name}`;
+    case DOC_CREATED_KIND:
+      return `${name} heeft "${parsed.docName}" aangemaakt`;
+    case DOC_OPENED_KIND:
+      return `${name} heeft "${parsed.docName}" geopend`;
+    case DOC_RENAMED_KIND:
+      return `${name} heeft "${parsed.oldName}" hernoemd naar "${parsed.newName}"`;
+    case DOC_DELETED_KIND:
+      return `${name} heeft "${parsed.docName ?? 'een document'}" verwijderd`;
+    case CALL_STARTED_KIND:
+      return `${name} heeft video-oproep "${parsed.callName}" gestart`;
+    case CALL_OPENED_KIND:
+      return `${name} heeft video-oproep "${parsed.callName}" geopend`;
+    case CALL_RENAMED_KIND:
+      return `${name} heeft video-oproep "${parsed.oldName}" hernoemd naar "${parsed.newName}"`;
+    case CALL_DELETED_KIND:
+      return `${name} heeft video-oproep "${parsed.callName ?? 'een video-oproep'}" verwijderd`;
+    case CHANNEL_META_KIND:
+      return parsed.name ? `${parsed.authorName ?? 'Iemand'} heeft het kanaal hernoemd naar "${parsed.name}"` : null;
+    default:
+      return null;
+  }
 }
 
 // Hoe lang een toast-popup zichtbaar blijft voordat 'm vanzelf verdwijnt.
@@ -822,6 +938,23 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     };
   }, [channelId]);
 
+  // .archive.jsonl — zie useArchiveDoc hierboven.
+  const { entries: archiveEntries, recordEvent: recordArchiveEvent } = useArchiveDoc(pool, identity, channelId, channelTag);
+
+  // Allereerste regel van het archief: alleen geschreven door wie het
+  // kanaal-ID hier zelf zojuist genereerde (zie freshlyCreatedChannelIds),
+  // dus precies één keer per kanaal, door de facto "oprichter" — niemand
+  // anders komt ooit voor dit exacte (128-bits willekeurige) ID in
+  // aanmerking. 'genesis' als vaste key: idempotent, net als bij gewone
+  // events (zie recordEvent in useArchiveDoc).
+  useEffect(() => {
+    if (!archiveEntries || !freshlyCreatedChannelIds.has(channelId)) return;
+    recordArchiveEvent(
+      'genesis',
+      JSON.stringify({ t: new Date().toISOString(), kind: 'genesis', text: `Kanaal aangemaakt — URL: ${window.location.href}` })
+    );
+  }, [archiveEntries, channelId]);
+
   // Bewaart het created_at van het laatst toegepaste kanaalnaam-/
   // documentenlijst-/video-oproepenlijst-event. Zonder deze guard kan een
   // ouder event dat via een tragere relay laat aankomt (bv. het originele
@@ -937,6 +1070,23 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
             if (isSelf || !isRecent) return;
             setEntries((prev) =>
               [...prev, { type: 'system', id: event.id, created_at: event.created_at, text }].sort((a, b) => entryTime(a) - entryTime(b))
+            );
+          }
+
+          // .archive.jsonl bijwerken — voor élk betekenisvol event, van
+          // onszelf of anderen, vers of oud (geen isSelf/isRecent-filter:
+          // dit is een archief, geen live-melding). describeArchiveEntry
+          // geeft null terug voor kinds die geen eigen regel verdienen (bv.
+          // de pure lijst-state-sync-kinds), dan gebeurt er niets.
+          // recordEvent is idempotent op event.id — cruciaal, want elke
+          // peer die dit event van de relay krijgt roept dit onafhankelijk
+          // aan; zonder dedup zou elk online lid zijn eigen dubbele regel
+          // toevoegen.
+          const archiveLine = describeArchiveEntry(event.kind, decrypted, event);
+          if (archiveLine) {
+            recordArchiveEvent(
+              event.id,
+              JSON.stringify({ t: new Date(event.created_at * 1000).toISOString(), kind: event.kind, text: archiveLine })
             );
           }
 
@@ -1211,7 +1361,13 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     if (!trimmed || !identity) return;
     const signed = await publishEvent(CHAT_KIND, [['t', chatTag]], trimmed);
     if (signed) {
-      seenRef.current.add(signed.id);
+      // Bewust géén seenRef.current.add(signed.id) hier (zoals voorheen):
+      // dat liet onevent() de latere relay-echo van dit eigen bericht
+      // stilzwijgend overslaan — inclusief het wegschrijven naar
+      // .archive.jsonl, dat op diezelfde onevent-doorloop leunt. De
+      // chat-tijdlijn hieronder dedupt toch al zelf op event-id, dus die
+      // vroege kortsluiting was voor de weergave niet eens nodig.
+      //
       // signed.content is de versleutelde ciphertext die daadwerkelijk de
       // deur uit ging; voor de eigen (optimistische) weergave tonen we
       // gewoon de leesbare tekst die we al hadden, i.p.v. 'm eerst weer te
@@ -1250,7 +1406,9 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
   }
 
   function createNewChannel() {
-    window.location.hash = generateChannelId();
+    const id = generateChannelId();
+    freshlyCreatedChannelIds.add(id);
+    window.location.hash = id;
     setMenuOpen(false);
   }
 
@@ -1434,6 +1592,15 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     setActiveItem(null);
   }
 
+  // .archive.jsonl openen: puur lokale navigatie, geen Nostr-event (geen
+  // "X heeft het archief geopend"-ruis) — het is geen actie die andere
+  // deelnemers hoeven te weten, alleen een eigen blik op wat er al
+  // gebeurd is.
+  function openArchive() {
+    setActiveItem({ type: 'archive' });
+    setMobileView('desktop');
+  }
+
   const currentChannel = savedChannels.find((c) => c.id === channelId);
   const channelName = currentChannel?.name ?? `Kanaal ${channelId.slice(0, 6)}`;
   // Eén keer berekend hier (i.p.v. dubbel in ChatPanel én WorkspaceHeader):
@@ -1488,6 +1655,8 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
         mobileView={mobileView}
         onToggleMenu={() => setMenuOpen((v) => !v)}
         totalUnread={totalUnread}
+        onOpenArchive={openArchive}
+        archiveEntries={archiveEntries}
       />
       <MobileViewSwitcher mobileView={mobileView} onChange={setMobileView} />
       <DockableVideoCall
@@ -2116,11 +2285,14 @@ function WorkspacePanel({
   mobileView,
   onToggleMenu,
   totalUnread,
+  onOpenArchive,
+  archiveEntries,
 }) {
   const activeDoc = activeItem?.type === 'doc' ? docs.find((d) => d.id === activeItem.id) : null;
   const activeCall = activeItem?.type === 'call' ? calls.find((c) => c.id === activeItem.id) : null;
+  const isArchive = activeItem?.type === 'archive';
   const activeDocSync = activeDoc ? docSyncInstances.get(activeDoc.id) : null;
-  const onDesktop = !activeDoc && !activeCall;
+  const onDesktop = !activeDoc && !activeCall && !isArchive;
 
   return (
     <div
@@ -2128,8 +2300,8 @@ function WorkspacePanel({
     >
       <WorkspaceHeader
         onDesktop={onDesktop}
-        icon={onDesktop ? '🖥️' : activeDoc ? '📄' : '📹'}
-        title={onDesktop ? 'Bureaublad' : activeDoc ? activeDoc.name : activeCall.name}
+        icon={onDesktop ? '🖥️' : activeDoc ? '📄' : isArchive ? '📜' : '📹'}
+        title={onDesktop ? 'Bureaublad' : activeDoc ? activeDoc.name : isArchive ? '.archive.jsonl' : activeCall.name}
         editable={Boolean(activeDoc || activeCall)}
         onRename={
           activeDoc
@@ -2155,6 +2327,7 @@ function WorkspacePanel({
             onCreateCall={onCreateCall}
             onDeleteDoc={onDeleteDoc}
             onDeleteCall={onDeleteCall}
+            onOpenArchive={onOpenArchive}
           />
         )}
         {activeDoc &&
@@ -2170,11 +2343,43 @@ function WorkspacePanel({
           ) : (
             <div className="h-full flex items-center justify-center text-slate-400 text-sm">Document wordt geladen…</div>
           ))}
+        {isArchive && <ArchiveViewer entries={archiveEntries} />}
         {/* De video-oproep zelf wordt niet hier gerenderd: Dashboard toont
               'm als een losse, vast-gepositioneerde laag (zie DockableVideoCall)
              die precies dit vlak overlapt — zo blijft de iframe (en dus de
              verbinding/audio) bestaan als je later dockt en elders navigeert. */}
       </div>
+    </div>
+  );
+}
+
+// Alleen-lezen weergave van .archive.jsonl — reageert live op nieuwe
+// entries (Y.Map, zie useArchiveDoc) via een handmatige observer, want
+// Yjs-wijzigingen triggeren geen React-render vanzelf. Elke opgeslagen
+// regel begint met `{"t":"<ISO-tijdstip>",...}`, dus een gewone
+// lexicografische stringsort levert al de juiste chronologische volgorde
+// op — geen aparte parse-en-sorteer-stap nodig.
+function ArchiveViewer({ entries }) {
+  const [, forceRender] = useState(0);
+
+  useEffect(() => {
+    if (!entries) return;
+    const onChange = () => forceRender((n) => n + 1);
+    entries.observe(onChange);
+    return () => entries.unobserve(onChange);
+  }, [entries]);
+
+  if (!entries) {
+    return <div className="h-full flex items-center justify-center text-slate-400 text-sm">Archief wordt geladen…</div>;
+  }
+
+  const lines = Array.from(entries.values()).sort();
+
+  return (
+    <div className="h-full overflow-y-auto bg-slate-50">
+      <pre className="p-4 text-xs font-mono text-slate-600 whitespace-pre-wrap break-all">
+        {lines.length === 0 ? '// Nog geen events in dit kanaal.' : lines.join('\n')}
+      </pre>
     </div>
   );
 }
@@ -2292,7 +2497,17 @@ function WorkspaceHeader({ onDesktop, icon, title, editable, onRename, onDock, o
 // starten (dat direct het bijbehorende Nostr-event de deur uit stuurt,
 // zodat andere deelnemers het ook zien verschijnen) — allemaal launch-
 // icons op één scherm, geen aparte tabjes.
-function WorkspaceDesktop({ docs, calls, onOpenDoc, onOpenCall, onCreateDoc, onCreateCall, onDeleteDoc, onDeleteCall }) {
+function WorkspaceDesktop({
+  docs,
+  calls,
+  onOpenDoc,
+  onOpenCall,
+  onCreateDoc,
+  onCreateCall,
+  onDeleteDoc,
+  onDeleteCall,
+  onOpenArchive,
+}) {
   const gridStyle = { gridTemplateColumns: 'repeat(auto-fill, minmax(84px, 1fr))' };
   const hasItems = docs.length > 0 || calls.length > 0;
   // { type: 'doc' | 'call', id, name } van het item waarvoor net op het
@@ -2324,6 +2539,19 @@ function WorkspaceDesktop({ docs, calls, onOpenDoc, onOpenCall, onCreateDoc, onC
         >
           <span className="text-4xl leading-none">📹</span>
           <span className="text-xs text-slate-500">Nieuwe video-oproep</span>
+        </button>
+        {/* Semi-transparant en bewust géén DesktopIcon (dus geen
+            hover-prullenbakje): dit is geen gewoon, verwijderbaar document
+            maar het altijd-aanwezige, automatisch bijgehouden logboek van
+            het kanaal — zichtbaar voor wie zoekt, geen ruis voor wie gewoon
+            aan het werk is. */}
+        <button
+          onClick={onOpenArchive}
+          className="flex flex-col items-center gap-1.5 p-2 rounded-lg hover:bg-slate-100 hover:opacity-100 opacity-50 text-center"
+          title=".archive.jsonl — alleen-lezen logboek van dit kanaal"
+        >
+          <span className="text-4xl leading-none">📜</span>
+          <span className="text-xs text-slate-500">.archive.jsonl</span>
         </button>
       </div>
 

@@ -191,6 +191,24 @@ identity-sleutel van elke peer.
   documenten) en dus een stabiele, altijd opnieuw te bereiken kamer bij
   `videobellen.pleio.nl/<kanaal-id>-<oproep-id>` — een zelfgehoste Jitsi
   Meet-instantie. De chat links blijft actief tijdens een gesprek.
+- **`.archive.jsonl`**: één, altijd-aanwezig (semi-transparant, niet
+  verwijderbaar) document per kanaal met een doorlopend, alleen-lezen
+  logboek van alle betekenisvolle events — chatberichten, presence,
+  documenten/oproepen aangemaakt/geopend/hernoemd/verwijderd, kanaal
+  hernoemd, en een genesis-regel ("Kanaal aangemaakt — URL: ...") die
+  alleen wordt geschreven door wie het kanaal-ID zelf zojuist genereerde
+  (zie `freshlyCreatedChannelIds`). Bewust géén gewoon document: geen
+  aanmaak-actie, geen vermelding in de documentenlijst, geen chat-pill —
+  het bestaat impliciet zodra het kanaal bestaat, met een vast uit
+  channelId/channelTag afgeleid ID (`useArchiveDoc`), zodat elke
+  deelnemer onafhankelijk dezelfde room construeert. Draait in dezelfde
+  achtergrond-syncset (IndexedDB + WebRTC) als een gewoon document, maar
+  met een `Y.Map` (key = event-id) in plaats van een `Y.Array`: zo blijft
+  het idempotent als meerdere online deelnemers hetzelfde event
+  onafhankelijk verwerken, zonder dubbele regels. Doel: een duurzamer
+  geheugen van het kanaal dan alleen wat relays toevallig bewaren — elke
+  actieve deelnemer draagt door de achtergrond-sync automatisch een eigen
+  volledige kopie mee, ook zonder daar zelf iets voor te hoeven doen.
 
 ## WebRTC-signaling via Nostr (geen aparte infra)
 
