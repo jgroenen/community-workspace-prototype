@@ -2,10 +2,27 @@
 <html lang="nl">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Community Workspace</title>
+
+    <!-- PWA: laat "Toevoegen aan beginscherm" de app fullscreen (zonder
+         browser-chrome) starten i.p.v. gewoon een bladwijzer te openen.
+         Android/Chrome leest hiervoor het manifest (display: standalone);
+         iOS Safari negeert het manifest grotendeels en heeft z'n eigen
+         apple-mobile-web-app-*-meta-tags nodig — vandaar beide. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#4338ca" />
+
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Workspace" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png" />
   </head>
-  <body class="m-0 h-screen w-screen overflow-hidden">
+  <body class="m-0 h-dvh w-screen overflow-hidden">
     <div id="root" class="h-full w-full"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>

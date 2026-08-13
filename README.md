@@ -144,7 +144,20 @@ identity-sleutel van elke peer.
   — zie `SavedChannelsOverlay`) en het menu zelf wordt op mobiel fullscreen
   in plaats van een kleine dropdown, met een expliciete sluitknop. Op
   desktop (md+) blijft alles zoals het was: beide panelen permanent naast
-  elkaar, één hamburger-knop, klein anker-dropdown-menu.
+  elkaar, één hamburger-knop, klein anker-dropdown-menu. Een video-oproep
+  openen/starten schakelt (net als een document) mee naar de werkruimte —
+  de call zelf verschijnt weliswaar sowieso als losstaande overlay (zie
+  DockableVideoCall), maar de dock-/sluitknop ervoor zit in
+  `WorkspaceHeader`, die anders onbereikbaar zou zijn. `h-dvh` i.p.v.
+  `h-screen` op de belangrijkste containers, zodat de onderste tabbalk niet
+  wegvalt achter mobiele browser-chrome (adresbalk) die bij `100vh` wél,
+  maar bij `100dvh` niet meetelt.
+- **Installeerbaar als PWA**: `index.html` linkt een webmanifest
+  (`display: standalone`) plus de losse `apple-mobile-web-app-*`-meta-tags
+  die iOS Safari (dat het manifest grotendeels negeert) nodig heeft, zodat
+  "Toevoegen aan beginscherm" de app fullscreen start, zonder browser-
+  chrome. Iconen (`public/icon.svg` + gegenereerde PNG's) gebruiken de
+  paarse chat-bubble-huisstijl van de app.
 - **Nostr-chat**: berichten zijn `kind 1`-events getagd met
   `t = wschat-<kanaal-id>`, gepubliceerd/opgehaald via `nostr-tools`
   (`SimplePool`) op `relay.damus.io`, `nos.lol` en `relay.nostr.band`. Zonder

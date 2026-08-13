@@ -714,7 +714,7 @@ export default function App() {
 
   if (!channelId) {
     return (
-      <div className="h-screen w-screen flex items-center justify-center bg-slate-100 text-slate-400 text-sm">
+      <div className="h-dvh w-screen flex items-center justify-center bg-slate-100 text-slate-400 text-sm">
         Kanaal wordt geladen…
       </div>
     );
@@ -1332,6 +1332,11 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
     setCalls(nextCalls);
     if (activeItem?.type !== 'call') preCallItemRef.current = activeItem;
     setActiveItem({ type: 'call', id });
+    // Op mobiel naar de werkruimte: de video zelf verschijnt weliswaar
+    // sowieso als losstaande overlay (zie DockableVideoCall), maar de
+    // dock-/sluitknop ervoor zit in WorkspaceHeader — die is onbereikbaar
+    // als WorkspacePanel op mobiel nog `hidden` staat (je op Chat zit).
+    setMobileView('desktop');
     publishEvent(CALLLIST_KIND, [['t', chatTag], ['d', callsDTag]], JSON.stringify(nextCalls));
     publishEvent(CALL_STARTED_KIND, [['t', chatTag]], JSON.stringify({ name: displayName, callId: id, callName: name }));
   }
@@ -1341,6 +1346,11 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
   // "geopend"-event, zodat iedereen een klikbare "X heeft Y geopend"-regel
   // in de chat krijgt.
   function openCall(callId, callName) {
+    // Op mobiel naar de werkruimte — zie createCall hierboven voor het
+    // waarom (dock-/sluitknop zit in WorkspaceHeader, niet in de overlay
+    // zelf). Ook bij een al-actieve of al-gedockte call: je klikte 'm net
+    // vanuit de chat, dus je wil de bedieningsknoppen meteen kunnen zien.
+    setMobileView('desktop');
     // Deze call is al de actieve fullscreen-view: geen nieuw event nodig.
     if (activeItem?.type === 'call' && activeItem.id === callId) return;
     // Is deze call al gedockt (draait dus al op de achtergrond)? Dan gewoon
@@ -1435,7 +1445,11 @@ function Dashboard({ channelId, pool, savedChannels, setSavedChannels, notificat
   );
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col md:flex-row bg-slate-100">
+    // h-dvh (dynamic viewport height) i.p.v. h-screen (100vh): mobiele
+    // browsers rekenen hun eigen, inklapbare adresbalk/chrome mee in 100vh,
+    // waardoor de onderste tabbalk (MobileViewSwitcher) net buiten beeld
+    // kon vallen. dvh past zich aan het daadwerkelijk zichtbare vlak aan.
+    <div className="h-dvh w-screen overflow-hidden flex flex-col md:flex-row bg-slate-100">
       <ChatPanel
         channelId={channelId}
         identity={identity}
